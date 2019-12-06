@@ -1,7 +1,11 @@
 <launch>
     <arg name="driver" default="os1_node"/>
+    <arg name="debug" default="true"/>
+    <env if="$(arg debug)" name="ROSCONSOLE_CONFIG_FILE" value="$(find ouster_ros)/launch/debug.conf"/>
 
-    <node pkg="ouster_ros" type="decoder" name="ouster_os1_decoder" output="screen">
+
+    <node pkg="ouster_ros" type="os1_decoder" name="ouster_os1_decoder" output="screen">
+
         <remap from="~os1_config" to="/$(arg driver)/os1_config"/>
         <remap from="~lidar_packets" to="/$(arg driver)/lidar_packets"/>
         <remap from="~imu_packets" to="/$(arg driver)/imu_packets"/>

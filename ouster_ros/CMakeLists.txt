@@ -23,6 +23,7 @@ find_package(
              tf2
              tf2_ros
              tf2_geometry_msgs
+             cv_bridge
              image_transport)
 
 add_message_files(FILES PacketMsg.msg)
@@ -43,6 +44,7 @@ catkin_package(
   std_msgs
   sensor_msgs
   geometry_msgs
+  cv_bridge
   image_transport
   ouster_client
   ouster_viz)
@@ -67,13 +69,15 @@ add_executable(img_node src/img_node.cpp)
 target_link_libraries(img_node ouster_ros ${catkin_LIBRARIES})
 add_dependencies(img_node ${PROJECT_NAME}_gencpp)
 
-add_executable(decoder src/decoder.cpp)
-target_include_directories(decoder PUBLIC ${catkin_INCLUDE_DIRS} include)
-target_link_libraries(decoder PUBLIC ${catkin_LIBRARIES})
+# decoder
+add_executable(os1_decoder src/os1_decoder.cpp)
+target_include_directories(os1_decoder PUBLIC ${catkin_INCLUDE_DIRS} include)
+target_link_libraries(os1_decoder PUBLIC ${catkin_LIBRARIES})
 
 install(
-  TARGETS os1_node os1_cloud_node viz_node img_node
+  TARGETS os1_node os1_cloud_node viz_node img_node os1_decoder
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})
-install(FILES os1.launch DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})
+install(FILES os1.launch launch/os1_decoder.launch
+        DESTINATION ${CATKIN_PACKAGE_SHARE_DESTINATION})

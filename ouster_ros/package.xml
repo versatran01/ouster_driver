@@ -32,6 +32,7 @@
   <exec_depend>ouster_viz</exec_depend>
 
   <depend>image_transport</depend>
+  <depend>cv_bridge</depend>
 
   <export></export>
 </package>
