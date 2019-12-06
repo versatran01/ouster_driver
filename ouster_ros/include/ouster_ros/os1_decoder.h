@@ -21,8 +21,6 @@ class Decoder {
   void LidarPacketCb(const PacketMsg& packet);
   void ImuPacketCb(const PacketMsg& packet);
 
-  static constexpr int kBlockPerPacket = 16;
-
  private:
   ros::NodeHandle pnh_;
   image_transport::ImageTransport it_;

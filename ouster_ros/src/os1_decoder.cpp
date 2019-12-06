@@ -9,6 +9,7 @@
 namespace ouster_ros {
 namespace OS1 {
 
+using namespace ouster::OS1;
 using sensor_msgs::Imu;
 using sensor_msgs::PointCloud2;
 
@@ -28,6 +29,7 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   auto client = pnh_.serviceClient<ouster_ros::OS1ConfigSrv>("os1_config");
   client.waitForExistence();
 
+  // Beam altitude angles go from top to bottom
   if (client.call(os1_srv)) {
     ROS_INFO("Reading sensor info from os1 config");
     const auto& cfg = os1_srv.response;
@@ -35,27 +37,27 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
     info_.beam_azimuth_angles = cfg.beam_azimuth_angles;
     info_.imu_to_sensor_transform = cfg.imu_to_sensor_transform;
     info_.lidar_to_sensor_transform = cfg.lidar_to_sensor_transform;
-    info_.mode = ouster::OS1::lidar_mode_of_string(cfg.lidar_mode);
+    info_.mode = lidar_mode_of_string(cfg.lidar_mode);
     info_.hostname = cfg.hostname;
   } else {
     ROS_ERROR("Calling os1 config service failed, revert to default");
-    info_.beam_altitude_angles = ouster::OS1::beam_altitude_angles;
-    info_.beam_azimuth_angles = ouster::OS1::beam_azimuth_angles;
-    info_.imu_to_sensor_transform = ouster::OS1::imu_to_sensor_transform;
-    info_.lidar_to_sensor_transform = ouster::OS1::lidar_to_sensor_transform;
-    info_.mode = ouster::OS1::MODE_1024x10;
+    info_.beam_altitude_angles = beam_altitude_angles;
+    info_.beam_azimuth_angles = beam_azimuth_angles;
+    info_.imu_to_sensor_transform = imu_to_sensor_transform;
+    info_.lidar_to_sensor_transform = lidar_to_sensor_transform;
+    info_.mode = MODE_1024x10;
     info_.hostname = "UNKNOWN";
   }
 
   ROS_INFO("Hostname: %s", info_.hostname.c_str());
   ROS_INFO("Lidar mode: %s", ouster::OS1::to_string(info_.mode).c_str());
 
-  image_width_ = 1024;
+  image_width_ = 1024 / pixels_per_column * pixels_per_column;
   image_height_ = info_.beam_altitude_angles.size();
   image_channel_ = 3;
   buffer_.reserve(image_width_);
-  if (image_height_ != ouster::OS1::pixels_per_column ||
-      image_height_ != ouster::OS1::pixels_per_column) {
+  if (image_height_ != pixels_per_column ||
+      image_height_ != pixels_per_column) {
     throw std::runtime_error("Invalid number of beams");
   }
 }
@@ -64,7 +66,7 @@ void Decoder::LidarPacketCb(const PacketMsg& packet) {
   ROS_DEBUG_THROTTLE(1, "Lidar packet size %zu", packet.buf.size());
   buffer_.push_back(packet);
 
-  const auto curr_width = buffer_.size() * kBlockPerPacket;
+  const auto curr_width = buffer_.size() * pixels_per_column;
 
   if (curr_width < image_width_) {
     return;
@@ -77,6 +79,7 @@ void Decoder::LidarPacketCb(const PacketMsg& packet) {
   ROS_DEBUG("Image: %d x %d", image.rows, image.cols);
 
   for (const PacketMsg& pack : buffer_) {
+    // Decode packet
   }
 
   buffer_.clear();
