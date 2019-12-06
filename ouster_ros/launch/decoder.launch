@@ -1,0 +1,10 @@
+<launch>
+    <arg name="driver" default="os1_node"/>
+
+    <node pkg="ouster_ros" type="decoder" name="ouster_os1_decoder" output="screen">
+        <remap from="~os1_config" to="/$(arg driver)/os1_config"/>
+        <remap from="~lidar_packets" to="/$(arg driver)/lidar_packets"/>
+        <remap from="~imu_packets" to="/$(arg driver)/imu_packets"/>
+    </node>
+
+</launch>

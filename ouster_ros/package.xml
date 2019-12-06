@@ -31,5 +31,7 @@
   <exec_depend>ouster_client</exec_depend>
   <exec_depend>ouster_viz</exec_depend>
 
+  <depend>image_transport</depend>
+
   <export></export>
 </package>
