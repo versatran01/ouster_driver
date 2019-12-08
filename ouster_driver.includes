@@ -7,3 +7,4 @@ ouster_viz/src
 /usr/local/include
 ~/Workspace/ws/sv_ws/devel/include
 ouster_ros/launch
+/usr/include/pcl-1.8

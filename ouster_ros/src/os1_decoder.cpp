@@ -3,21 +3,33 @@
 #include "ouster_ros/OS1ConfigSrv.h"
 
 #include <cv_bridge/cv_bridge.h>
+#include <pcl/point_types.h>
+#include <pcl_conversions/pcl_conversions.h>
+#include <pcl_ros/point_cloud.h>
+#include <sensor_msgs/CameraInfo.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
 
 namespace ouster_ros {
 namespace OS1 {
 
-static constexpr float deg2rad(float deg) { return deg * M_PI / 180.0; }
-static constexpr float rad2deg(float rad) { return rad * 180.0 / M_PI; }
-static constexpr float kNaNF = std::numeric_limits<float>::quiet_NaN();
-static constexpr float kNaND = std::numeric_limits<double>::quiet_NaN();
-static constexpr double kTauRadD = 2 * M_PI;
-
 using namespace ouster::OS1;
-using sensor_msgs::Imu;
-using sensor_msgs::PointCloud2;
+using namespace sensor_msgs;
+using PointT = pcl::PointXYZI;
+using CloudT = pcl::PointCloud<PointT>;
+
+static constexpr double deg2rad(double deg) { return deg * M_PI / 180.0; }
+static constexpr double rad2deg(double rad) { return rad * 180.0 / M_PI; }
+static constexpr auto kNaNF = std::numeric_limits<float>::quiet_NaN();
+
+/// Convert a vector of double from deg to rad
+void TransformDeg2RadInPlace(std::vector<double>& vec) {
+  std::transform(vec.begin(), vec.end(), vec.begin(), deg2rad);
+}
+
+/// Convert image to point cloud
+CloudT::Ptr ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
+                    bool organized);
 
 Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   // IO
@@ -57,23 +69,27 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   }
 
   // Convert all angles to rad
+  TransformDeg2RadInPlace(info_.beam_altitude_angles);
+  TransformDeg2RadInPlace(info_.beam_azimuth_angles);
 
   ROS_INFO("Hostname: %s", info_.hostname.c_str());
   ROS_INFO("Lidar mode: %s", to_string(info_.mode).c_str());
 
-  image_width_ = 1024 / pixels_per_column * pixels_per_column;
+  // make sure image_width is a multiple of 16 (cols in packet)
+  image_width_ = 2048 / columns_per_buffer * columns_per_buffer;
   image_height_ = info_.beam_altitude_angles.size();
   buffer_.reserve(image_width_);
+
   if (image_height_ != pixels_per_column) {
     throw std::runtime_error("Invalid number of beams");
   }
 }
 
 void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
-  ROS_DEBUG_THROTTLE(1, "Lidar packet size %zu", packet_msg.buf.size());
+  //  ROS_DEBUG_THROTTLE(1, "Lidar packet size %zu", packet_msg.buf.size());
   buffer_.push_back(packet_msg);
 
-  const auto curr_width = buffer_.size() * pixels_per_column;
+  const auto curr_width = buffer_.size() * columns_per_buffer;
 
   if (curr_width < image_width_) {
     return;
@@ -81,12 +97,10 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
 
   // We have enough buffer decode
   ROS_DEBUG("Got enough packets %zu, ready to publish", buffer_.size());
-  cv::Mat image = cv::Mat(image_height_, curr_width, CV_32FC2, cv::Scalar());
-  ROS_DEBUG("Image: %d x %d", image.rows, image.cols);
-
-  // Each packet contains 16 azimuth block so can fill 16 columns of the range
-  // image
-  std::vector<double> azimuths(curr_width, kNaND);
+  // [range, reflectivity, azimuth, (noise)]
+  cv::Mat image = cv::Mat(image_height_, curr_width, CV_32FC3,
+                          cv::Scalar(kNaNF));  // all NaNs
+  ROS_DEBUG("Image: %d x %d x %d", image.rows, image.cols, image.channels());
 
   for (int ibuf = 0; ibuf < buffer_.size(); ++ibuf) {
     const PacketMsg& packet = buffer_[ibuf];
@@ -107,30 +121,103 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
         continue;
       }
 
-      // Put in valid azimuth angle
       const int col = ibuf * columns_per_buffer + icol;
-      const float theta0 = col_h_angle(col_buf);
+      const float theta0 = col_h_angle(col_buf);  // rad
 
       // Decode each beam
       for (uint8_t ipx = 0; ipx < pixels_per_column; ipx++) {
         const uint8_t* px_buf = nth_px(ipx, col_buf);
         const uint32_t range = px_range(px_buf);
 
-        // row - ipx, col - ipack * 16 + icol
-        const int row = ipx;
-
-        cv::Vec2f& v = image.at<cv::Vec2f>(row, col);
+        auto& v = image.at<cv::Vec3f>(ipx, col);
         v[0] = range * 0.001f;
         v[1] = px_reflectivity(px_buf);
+        v[2] = theta0 + info_.beam_azimuth_angles[ipx];
       }
     }
   }
+
+  std_msgs::Header header;
+  header.frame_id = "os1_lidar";  // TODO
+
+  const ImagePtr image_msg =
+      cv_bridge::CvImage(header, "32FC3", image).toImageMsg();
+  const CameraInfoPtr cinfo_msg(new CameraInfo);
+  cinfo_msg->header = header;
+  cinfo_msg->height = image_msg->height;
+  cinfo_msg->width = image_msg->width;
+  cinfo_msg->D = info_.beam_altitude_angles;
+
+  camera_pub_.publish(image_msg, cinfo_msg);
+  lidar_pub_.publish(ToCloud(image_msg, *cinfo_msg, false));
 
   buffer_.clear();
 }
 
 void Decoder::ImuPacketCb(const PacketMsg& packet) {
-  ROS_DEBUG_THROTTLE(1, "Imu packet size %zu", packet.buf.size());
+  //  ROS_DEBUG_THROTTLE(1, "Imu packet size %zu", packet.buf.size());
+}
+
+CloudT::Ptr ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
+                    bool organized) {
+  CloudT::Ptr cloud_ptr(new CloudT);
+  CloudT& cloud = *cloud_ptr;
+
+  const auto image = cv_bridge::toCvShare(image_msg)->image;
+  const auto& altitude_angles = cinfo_msg.D;
+
+  cloud.header = pcl_conversions::toPCL(image_msg->header);
+  cloud.reserve(image.total());
+
+  for (int r = 0; r < image.rows; ++r) {
+    const auto* const row_ptr = image.ptr<cv::Vec3f>(r);
+    // Because image row 0 is the highest laser point
+    const auto phi = altitude_angles[r];
+    const auto cos_phi = std::cos(phi);
+    const auto sin_phi = std::sin(phi);
+
+    for (int c = 0; c < image.cols; ++c) {
+      const cv::Vec3f& data = row_ptr[c];  // [range, reflectivity, azimuth]
+
+      PointT p;
+      if (std::isnan(data[0])) {
+        if (organized) {
+          p.x = p.y = p.z = kNaNF;
+          cloud.points.push_back(p);
+        }
+      } else {
+        // p.23 lidar range data to xyz lidar coordinate frame
+        // x = d * cos(w) * sin(a);
+        // y = d * cos(w) * cos(a);
+        // z = d * sin(w)
+        const auto theta = data[2];
+        const float R = data[0];
+        const auto x = R * cos_phi * std::cos(theta);
+        const auto y = R * cos_phi * std::sin(theta);
+        const auto z = R * sin_phi;
+
+        // original velodyne frame is x right y forward
+        // we make x forward and y left, thus 0 azimuth is at x = 0 and
+        // goes clockwise
+        p.x = y;
+        p.y = -x;
+        p.z = z;
+        p.intensity = data[1];
+
+        cloud.points.push_back(p);
+      }
+    }
+  }
+
+  if (organized) {
+    cloud.width = image.cols;
+    cloud.height = image.rows;
+  } else {
+    cloud.width = cloud.size();
+    cloud.height = 1;
+  }
+
+  return cloud_ptr;
 }
 
 }  // namespace OS1
