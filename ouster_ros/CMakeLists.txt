@@ -74,7 +74,7 @@ add_dependencies(img_node ${PROJECT_NAME}_gencpp)
 # decoder
 add_executable(os1_decoder src/os1_decoder.cpp)
 target_include_directories(os1_decoder PUBLIC ${catkin_INCLUDE_DIRS} include)
-target_link_libraries(os1_decoder PUBLIC ${catkin_LIBRARIES})
+target_link_libraries(os1_decoder PUBLIC ${catkin_LIBRARIES} ouster_ros)
 add_dependencies(os1_decoder ${PROJECT_NAME}_gencfg)
 
 install(

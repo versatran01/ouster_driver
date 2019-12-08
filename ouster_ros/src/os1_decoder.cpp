@@ -1,6 +1,8 @@
 #include "ouster_ros/os1_decoder.h"
+
 #include "ouster/os1_util.h"
 #include "ouster_ros/OS1ConfigSrv.h"
+#include "ouster_ros/os1_ros.h"
 
 #include <cv_bridge/cv_bridge.h>
 #include <pcl/point_types.h>
@@ -9,6 +11,7 @@
 #include <sensor_msgs/CameraInfo.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <tf2/buffer_core.h>
 
 namespace ouster_ros {
 namespace OS1 {
@@ -21,7 +24,8 @@ using CloudT = pcl::PointCloud<PointT>;
 static constexpr double deg2rad(double deg) { return deg * M_PI / 180.0; }
 static constexpr double rad2deg(double rad) { return rad * 180.0 / M_PI; }
 static constexpr auto kNaNF = std::numeric_limits<float>::quiet_NaN();
-static constexpr float range_factor = 0.001f;
+static constexpr float range_factor = 0.001f;       // mm -> m
+static constexpr double kDefaultGravity = 9.81645;  // [m/s^2] in philadelphia
 
 /// Convert a vector of double from deg to rad
 void TransformDeg2RadInPlace(std::vector<double>& vec) {
@@ -32,7 +36,46 @@ void TransformDeg2RadInPlace(std::vector<double>& vec) {
 CloudT::Ptr ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
                     bool organized);
 
+/// Convert imu packet imu msg
+Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity) {
+  Imu m;
+  const uint8_t* buf = p.buf.data();
+
+  // Ouster provides timestamps for both the gyro and accelerometer in order to
+  // give access to the lowest level information. In most applications it is
+  // acceptable to use the average of the two timestamps.
+  const auto ts = imu_gyro_ts(buf) / 2 + imu_accel_ts(buf) / 2;
+  m.header.stamp.fromNSec(ts);
+  m.header.frame_id = frame_id;
+
+  m.orientation.x = 0;
+  m.orientation.y = 0;
+  m.orientation.z = 0;
+  m.orientation.w = 0;
+
+  m.linear_acceleration.x = imu_la_x(buf) * gravity;
+  m.linear_acceleration.y = imu_la_y(buf) * gravity;
+  m.linear_acceleration.z = imu_la_z(buf) * gravity;
+
+  m.angular_velocity.x = imu_av_x(buf) * M_PI / 180.0;
+  m.angular_velocity.y = imu_av_y(buf) * M_PI / 180.0;
+  m.angular_velocity.z = imu_av_z(buf) * M_PI / 180.0;
+
+  for (int i = 0; i < 9; i++) {
+    m.orientation_covariance[i] = -1;
+    m.angular_velocity_covariance[i] = 0;
+    m.linear_acceleration_covariance[i] = 0;
+  }
+  for (int i = 0; i < 9; i += 4) {
+    m.linear_acceleration_covariance[i] = 0.01;
+    m.angular_velocity_covariance[i] = 6e-4;
+  }
+
+  return m;
+}
+
 Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
+  // Setup reconfigure server
   server_.setCallback(boost::bind(&Decoder::ConfigCb, this, _1, _2));
 
   // Call service to retrieve sensor information
@@ -65,8 +108,23 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   TransformDeg2RadInPlace(info_.beam_altitude_angles);
   TransformDeg2RadInPlace(info_.beam_azimuth_angles);
 
+  // frame ids
+  lidar_frame_ = pnh_.param<std::string>("cloud_frame", "os1_lidar");
+  imu_frame_ = pnh_.param<std::string>("imu_frame", "os1_imu");
+  sensor_frame_ = pnh_.param<std::string>("sensor_frame", "os1_sensor");
+  gravity_ = pnh_.param<double>("gravity", kDefaultGravity);
+
+  // tf
+  broadcaster_.sendTransform(transform_to_tf_msg(info_.imu_to_sensor_transform,
+                                                 sensor_frame_, imu_frame_));
+  broadcaster_.sendTransform(transform_to_tf_msg(
+      info_.lidar_to_sensor_transform, sensor_frame_, lidar_frame_));
+
   ROS_INFO("Hostname: %s", info_.hostname.c_str());
   ROS_INFO("Lidar mode: %s", to_string(info_.mode).c_str());
+  ROS_INFO("Lidar frame: %s", lidar_frame_.c_str());
+  ROS_INFO("Imu frame: %s", imu_frame_.c_str());
+  ROS_INFO("Gravity: %f m/s^2", gravity_);
 }
 
 void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
@@ -83,7 +141,7 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   ROS_DEBUG("Got enough packets %zu, ready to publish", buffer_.size());
   // [range, reflectivity, azimuth, (noise)]
   cv::Mat image = cv::Mat(pixels_per_column, curr_width, CV_32FC3,
-                          cv::Scalar(kNaNF));  // all NaNs
+                          cv::Scalar(kNaNF));  // Init to all NaNs
   ROS_DEBUG("Image: %d x %d x %d", image.rows, image.cols, image.channels());
 
   for (int ibuf = 0; ibuf < buffer_.size(); ++ibuf) {
@@ -93,11 +151,8 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
     // Decode each azimuth block
     for (int icol = 0; icol < columns_per_buffer; ++icol) {
       const uint8_t* col_buf = nth_col(icol, packet_buf);
-      const uint16_t m_id = col_measurement_id(col_buf);
-      const uint16_t f_id = col_frame_id(col_buf);
+      // const uint16_t m_id = col_measurement_id(col_buf);
       const bool valid = col_valid(col_buf) == 0xffffffff;
-      // If a packet is bad (not valid) measurement_id, encoder count, range,
-      // and reflectivity will also be 0
 
       // drop invalid data in case of misconfiguration
       if (!valid) {
@@ -114,15 +169,22 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
         const uint32_t range = px_range(px_buf);
 
         auto& v = image.at<cv::Vec3f>(ipx, col);
-        v[0] = range * range_factor;
-        v[1] = px_reflectivity(px_buf);
-        v[2] = theta0 + info_.beam_azimuth_angles[ipx];
+        // we use reflectivity which is intensity scaled based on range
+        v[0] = range * range_factor;                     // range
+        v[1] = px_reflectivity(px_buf);                  // reflectivity
+        v[2] = theta0 + info_.beam_azimuth_angles[ipx];  // azimuth
       }
     }
   }
 
   std_msgs::Header header;
-  header.frame_id = "os1_lidar";  // TODO
+  header.frame_id = lidar_frame_;
+  // p.20 If the azimuth data block status is bad, words in the data block will
+  // be set to 0x0, but timestamp, measurement id, frame id, and encoder count
+  // will remain valid
+  // Thus we can always use the timestamp of the first packet
+  const uint64_t ts = col_timestamp(buffer_.front().buf.data());
+  header.stamp.fromNSec(ts);
 
   const ImagePtr image_msg =
       cv_bridge::CvImage(header, "32FC3", image).toImageMsg();
@@ -133,13 +195,15 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   cinfo_msg->D = info_.beam_altitude_angles;
 
   camera_pub_.publish(image_msg, cinfo_msg);
-  cloud_pub_.publish(ToCloud(image_msg, *cinfo_msg, config_.organized));
+  lidar_pub_.publish(ToCloud(image_msg, *cinfo_msg, config_.organized));
 
   buffer_.clear();
 }
 
-void Decoder::ImuPacketCb(const PacketMsg& packet) {
+void Decoder::ImuPacketCb(const PacketMsg& packet_msg) {
   //  ROS_DEBUG_THROTTLE(1, "Imu packet size %zu", packet.buf.size());
+  auto imu_msg = ToImu(packet_msg, imu_frame_, gravity_);
+  imu_pub_.publish(imu_msg);
 }
 
 void Decoder::ConfigCb(OusterOS1Config& config, int level) {
@@ -172,7 +236,7 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
 
     imu_pub_ = pnh_.advertise<Imu>("imu", 100);
     camera_pub_ = it_.advertiseCamera("image", 10);
-    cloud_pub_ = pnh_.advertise<PointCloud2>("cloud", 10);
+    lidar_pub_ = pnh_.advertise<PointCloud2>("cloud", 10);
     ROS_INFO("Decoder initialized");
   }
 }
@@ -209,8 +273,8 @@ CloudT::Ptr ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
         // x = d * cos(phi) * cos(theta);
         // y = d * cos(phi) * sin(theta);
         // z = d * sin(phi)
-        const auto theta = data[2];
         const auto d = data[0];
+        const auto theta = data[2];
         const auto x = d * cos_phi * std::cos(theta);
         const auto y = d * cos_phi * std::sin(theta);
         const auto z = d * sin_phi;
@@ -240,7 +304,7 @@ CloudT::Ptr ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
 }  // namespace ouster_ros
 
 int main(int argc, char** argv) {
-  ros::init(argc, argv, "ouster_os1_decoder");
+  ros::init(argc, argv, "os1_decoder");
   ros::NodeHandle pnh("~");
 
   ouster_ros::OS1::Decoder node(pnh);
