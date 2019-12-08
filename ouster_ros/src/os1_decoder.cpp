@@ -21,6 +21,7 @@ using CloudT = pcl::PointCloud<PointT>;
 static constexpr double deg2rad(double deg) { return deg * M_PI / 180.0; }
 static constexpr double rad2deg(double rad) { return rad * 180.0 / M_PI; }
 static constexpr auto kNaNF = std::numeric_limits<float>::quiet_NaN();
+static constexpr float range_factor = 0.001f;
 
 /// Convert a vector of double from deg to rad
 void TransformDeg2RadInPlace(std::vector<double>& vec) {
@@ -32,15 +33,7 @@ CloudT::Ptr ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
                     bool organized);
 
 Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
-  // IO
-  imu_packet_sub_ =
-      pnh_.subscribe("imu_packets", 100, &Decoder::ImuPacketCb, this);
-  lidar_packet_sub_ =
-      pnh_.subscribe("lidar_packets", 2048, &Decoder::LidarPacketCb, this);
-
-  imu_pub_ = pnh_.advertise<Imu>("imu", 100);
-  camera_pub_ = it_.advertiseCamera("image", 10);
-  lidar_pub_ = pnh_.advertise<PointCloud2>("cloud", 10);
+  server_.setCallback(boost::bind(&Decoder::ConfigCb, this, _1, _2));
 
   // Call service to retrieve sensor information
   OS1ConfigSrv os1_srv;
@@ -59,7 +52,7 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
     info_.mode = lidar_mode_of_string(cfg.lidar_mode);
     info_.hostname = cfg.hostname;
   } else {
-    ROS_ERROR("Calling os1 config service failed, revert to default");
+    ROS_WARN("Calling os1 config service failed, revert to default");
     info_.beam_altitude_angles = beam_altitude_angles;
     info_.beam_azimuth_angles = beam_azimuth_angles;
     info_.imu_to_sensor_transform = imu_to_sensor_transform;
@@ -74,15 +67,6 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
 
   ROS_INFO("Hostname: %s", info_.hostname.c_str());
   ROS_INFO("Lidar mode: %s", to_string(info_.mode).c_str());
-
-  // make sure image_width is a multiple of 16 (cols in packet)
-  image_width_ = 2048 / columns_per_buffer * columns_per_buffer;
-  image_height_ = info_.beam_altitude_angles.size();
-  buffer_.reserve(image_width_);
-
-  if (image_height_ != pixels_per_column) {
-    throw std::runtime_error("Invalid number of beams");
-  }
 }
 
 void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
@@ -91,14 +75,14 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
 
   const auto curr_width = buffer_.size() * columns_per_buffer;
 
-  if (curr_width < image_width_) {
+  if (curr_width < config_.image_width) {
     return;
   }
 
   // We have enough buffer decode
   ROS_DEBUG("Got enough packets %zu, ready to publish", buffer_.size());
   // [range, reflectivity, azimuth, (noise)]
-  cv::Mat image = cv::Mat(image_height_, curr_width, CV_32FC3,
+  cv::Mat image = cv::Mat(pixels_per_column, curr_width, CV_32FC3,
                           cv::Scalar(kNaNF));  // all NaNs
   ROS_DEBUG("Image: %d x %d x %d", image.rows, image.cols, image.channels());
 
@@ -130,7 +114,7 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
         const uint32_t range = px_range(px_buf);
 
         auto& v = image.at<cv::Vec3f>(ipx, col);
-        v[0] = range * 0.001f;
+        v[0] = range * range_factor;
         v[1] = px_reflectivity(px_buf);
         v[2] = theta0 + info_.beam_azimuth_angles[ipx];
       }
@@ -149,13 +133,48 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   cinfo_msg->D = info_.beam_altitude_angles;
 
   camera_pub_.publish(image_msg, cinfo_msg);
-  lidar_pub_.publish(ToCloud(image_msg, *cinfo_msg, false));
+  cloud_pub_.publish(ToCloud(image_msg, *cinfo_msg, config_.organized));
 
   buffer_.clear();
 }
 
 void Decoder::ImuPacketCb(const PacketMsg& packet) {
   //  ROS_DEBUG_THROTTLE(1, "Imu packet size %zu", packet.buf.size());
+}
+
+void Decoder::ConfigCb(OusterOS1Config& config, int level) {
+  // min_range should <= max_range
+  config.min_range = std::min(config.min_range, config.max_range);
+
+  // image_width is a multiple of columns_per_buffer
+  config.image_width /= columns_per_buffer;
+  config.image_width *= columns_per_buffer;
+
+  ROS_INFO(
+      "Reconfigure Request: min_range: %f, max_range: %f, image_width: %d, "
+      "organized: %s, full_sweep: %s",
+      config.min_range, config.max_range, config.image_width,
+      config.organized ? "True" : "False",
+      config.full_sweep ? "True" : "False");
+
+  config_ = config;
+  buffer_.clear();
+  buffer_.reserve(config_.image_width);
+
+  // Initialization
+  if (level < 0) {
+    // IO
+    ROS_INFO("Initialize ROS subscriber/publisher");
+    imu_packet_sub_ =
+        pnh_.subscribe("imu_packets", 100, &Decoder::ImuPacketCb, this);
+    lidar_packet_sub_ =
+        pnh_.subscribe("lidar_packets", 2048, &Decoder::LidarPacketCb, this);
+
+    imu_pub_ = pnh_.advertise<Imu>("imu", 100);
+    camera_pub_ = it_.advertiseCamera("image", 10);
+    cloud_pub_ = pnh_.advertise<PointCloud2>("cloud", 10);
+    ROS_INFO("Decoder initialized");
+  }
 }
 
 CloudT::Ptr ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
@@ -182,25 +201,22 @@ CloudT::Ptr ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
       PointT p;
       if (std::isnan(data[0])) {
         if (organized) {
-          p.x = p.y = p.z = kNaNF;
+          p.x = p.y = p.z = p.intensity = kNaNF;
           cloud.points.push_back(p);
         }
       } else {
         // p.23 lidar range data to xyz lidar coordinate frame
-        // x = d * cos(w) * sin(a);
-        // y = d * cos(w) * cos(a);
-        // z = d * sin(w)
+        // x = d * cos(phi) * cos(theta);
+        // y = d * cos(phi) * sin(theta);
+        // z = d * sin(phi)
         const auto theta = data[2];
-        const float R = data[0];
-        const auto x = R * cos_phi * std::cos(theta);
-        const auto y = R * cos_phi * std::sin(theta);
-        const auto z = R * sin_phi;
+        const auto d = data[0];
+        const auto x = d * cos_phi * std::cos(theta);
+        const auto y = d * cos_phi * std::sin(theta);
+        const auto z = d * sin_phi;
 
-        // original velodyne frame is x right y forward
-        // we make x forward and y left, thus 0 azimuth is at x = 0 and
-        // goes clockwise
-        p.x = y;
-        p.y = -x;
+        p.x = x;
+        p.y = -y;
         p.z = z;
         p.intensity = data[1];
 

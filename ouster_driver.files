@@ -12,6 +12,7 @@ ouster_client/src/os1.cpp
 ouster_client/src/os1_util.cpp
 ouster_ros/CMakeLists.txt
 ouster_ros/README.md
+ouster_ros/cfg/OusterOS1.cfg
 ouster_ros/include/ouster_ros/os1_decoder.h
 ouster_ros/include/ouster_ros/os1_ros.h
 ouster_ros/include/ouster_ros/point_os1.h

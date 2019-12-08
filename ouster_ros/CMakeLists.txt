@@ -24,13 +24,15 @@ find_package(
              tf2_ros
              tf2_geometry_msgs
              cv_bridge
-             image_transport)
+             image_transport
+             dynamic_reconfigure)
 
 add_message_files(FILES PacketMsg.msg)
 add_service_files(FILES OS1ConfigSrv.srv)
 generate_messages(DEPENDENCIES std_msgs sensor_msgs geometry_msgs)
 
 include_directories(include ${catkin_INCLUDE_DIRS})
+generate_dynamic_reconfigure_options(cfg/OusterOS1.cfg)
 
 catkin_package(
   INCLUDE_DIRS
@@ -73,6 +75,7 @@ add_dependencies(img_node ${PROJECT_NAME}_gencpp)
 add_executable(os1_decoder src/os1_decoder.cpp)
 target_include_directories(os1_decoder PUBLIC ${catkin_INCLUDE_DIRS} include)
 target_link_libraries(os1_decoder PUBLIC ${catkin_LIBRARIES})
+add_dependencies(os1_decoder ${PROJECT_NAME}_gencfg)
 
 install(
   TARGETS os1_node os1_cloud_node viz_node img_node os1_decoder
