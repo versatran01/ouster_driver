@@ -12,6 +12,7 @@
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <tf2/buffer_core.h>
+#include <Eigen/Geometry>
 
 namespace ouster_ros {
 namespace OS1 {
@@ -24,9 +25,12 @@ using CloudT = pcl::PointCloud<PointT>;
 static constexpr double deg2rad(double deg) { return deg * M_PI / 180.0; }
 static constexpr double rad2deg(double rad) { return rad * 180.0 / M_PI; }
 static constexpr auto kNaNF = std::numeric_limits<float>::quiet_NaN();
-static constexpr float range_factor = 0.001f;       // mm -> m
+static constexpr float kRangeFactor = 0.001f;       // mm -> m
 static constexpr double kDefaultGravity = 9.81645;  // [m/s^2] in philadelphia
 
+enum Index { RANGE = 0, REFLECTIVITY = 1, AZIMUTH = 2 };
+
+/// Get frequency from lidar mode
 int freq_of_lidar_mode(lidar_mode mode) {
   switch (mode) {
     case MODE_512x10:
@@ -97,13 +101,40 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   imu_frame_ = pnh_.param<std::string>("imu_frame", "os1_imu");
   lidar_frame_ = pnh_.param<std::string>("cloud_frame", "os1_lidar");
   sensor_frame_ = pnh_.param<std::string>("sensor_frame", "os1_sensor");
-  use_host_time_ = pnh_.param<bool>("use_host_time", false);
+  //  use_host_time_ = pnh_.param<bool>("use_host_time", false);
 
-  // tf
-  broadcaster_.sendTransform(transform_to_tf_msg(
-      info_.lidar_to_sensor_transform, sensor_frame_, lidar_frame_));
-  broadcaster_.sendTransform(transform_to_tf_msg(info_.imu_to_sensor_transform,
-                                                 sensor_frame_, imu_frame_));
+  // transform
+  // we assume sensor frame is aligned with lidar frame, thus lidar x is forward
+  // and lidar y points left. This also means that imu is now aligned with lidar
+  // with only a translational offset
+  //               ^ x_l
+  //        x_i^   |
+  //           |   |
+  // y_i <-----o   |
+  //               |
+  // <-------------o
+  // y_l
+  // Thus the only transform we need to publish is imu to lidar, T_L_I
+  // Fix lidar frame to be aligned with senspr frame
+  info_.lidar_to_sensor_transform[0] = info_.lidar_to_sensor_transform[5] = 1;
+  std::vector<double> imu_to_lidar_transform(16, 0);
+  using Matrix4dRow = Eigen::Matrix<double, 4, 4, Eigen::RowMajor>;
+  const Eigen::Map<Matrix4dRow> T_S_L(info_.lidar_to_sensor_transform.data());
+  const Eigen::Map<Matrix4dRow> T_S_I(info_.imu_to_sensor_transform.data());
+  Eigen::Map<Matrix4dRow> T_L_I(imu_to_lidar_transform.data());
+  T_L_I = T_S_L.inverse() * T_S_I;  // T_L_I = T_L_S * T_S_I
+
+  ROS_INFO_STREAM("T_S_L:\n" << T_S_L);
+  ROS_INFO_STREAM("T_S_I:\n" << T_S_I);
+  ROS_INFO_STREAM("T_L_I:\n" << T_L_I);
+
+  broadcaster_.sendTransform(
+      transform_to_tf_msg(imu_to_lidar_transform, lidar_frame_, imu_frame_));
+  //  broadcaster_.sendTransform(transform_to_tf_msg(
+  //      info_.lidar_to_sensor_transform, sensor_frame_, lidar_frame_));
+  //  broadcaster_.sendTransform(transform_to_tf_msg(info_.imu_to_sensor_transform,
+  //                                                 sensor_frame_,
+  //                                                 imu_frame_));
 
   ROS_INFO("Hostname: %s", info_.hostname.c_str());
   ROS_INFO("Lidar mode: %s", to_string(info_.mode).c_str());
@@ -115,12 +146,13 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
 
 void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   // If we use ros time, then we record the first packet time
-  if (use_host_time_ && !HostTimeReady()) {
-    host_time_first_ = ros::Time::now().toNSec();
-    sensor_time_first_ = col_timestamp(packet_msg.buf.data());
-    ROS_INFO("Record first host time %zu and sensor time %zu", host_time_first_,
-             sensor_time_first_);
-  }
+  //  if (use_host_time_ && !HostTimeReady()) {
+  //    host_time_first_ = ros::Time::now().toNSec();
+  //    sensor_time_first_ = col_timestamp(packet_msg.buf.data());
+  //    ROS_INFO("Record first host time %zu and sensor time %zu",
+  //    host_time_first_,
+  //             sensor_time_first_);
+  //  }
 
   buffer_.push_back(packet_msg);
 
@@ -154,7 +186,8 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
       }
 
       const int col = ibuf * columns_per_buffer + icol;
-      const float theta0 = col_h_angle(col_buf);  // rad
+      // Add pi to theta to compensate for the lidar frame change
+      const float theta0 = col_h_angle(col_buf) + M_PI;  // rad
 
       // Decode each beam (64 per block)
       for (uint8_t ipx = 0; ipx < pixels_per_column; ipx++) {
@@ -163,9 +196,9 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
 
         auto& v = image.at<cv::Vec3f>(ipx, col);
         // we use reflectivity which is intensity scaled based on range
-        v[0] = range * range_factor;                     // range
-        v[1] = px_reflectivity(px_buf);                  // reflectivity
-        v[2] = theta0 + info_.beam_azimuth_angles[ipx];  // azimuth
+        v[RANGE] = range * kRangeFactor;
+        v[REFLECTIVITY] = px_reflectivity(px_buf);
+        v[AZIMUTH] = theta0 + info_.beam_azimuth_angles[ipx];
       }
     }
   }
@@ -177,9 +210,9 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   // will remain valid
   // Thus we can always use the timestamp of the first packet
   uint64_t ts = col_timestamp(buffer_.front().buf.data());
-  if (use_host_time_) {
-    ts = ToHostTime(ts);
-  }
+  //  if (use_host_time_) {
+  //    ts = ToHostTime(ts);
+  //  }
   header.stamp.fromNSec(ts);
 
   const ImagePtr image_msg =
@@ -198,16 +231,17 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
 }
 
 void Decoder::ImuPacketCb(const PacketMsg& packet_msg) {
-  if (use_host_time_ && (host_time_first_ == 0 || sensor_time_first_ == 0)) {
-    ROS_INFO("Use ros time, waiting for the first device time");
-    return;
-  }
+  //  if (use_host_time_ && (host_time_first_ == 0 || sensor_time_first_ == 0))
+  //  {
+  //    ROS_INFO("Use ros time, waiting for the first device time");
+  //    return;
+  //  }
 
-  auto imu_msg = ToImu(packet_msg, imu_frame_, gravity_);
-  if (use_host_time_) {
-    auto ts = imu_msg.header.stamp.toNSec();
-    imu_msg.header.stamp.fromNSec(ToHostTime(ts));
-  }
+  const auto imu_msg = ToImu(packet_msg, imu_frame_, gravity_);
+  //  if (use_host_time_) {
+  //    auto ts = imu_msg.header.stamp.toNSec();
+  //    imu_msg.header.stamp.fromNSec(ToHostTime(ts));
+  //  }
   imu_pub_.publish(imu_msg);
 }
 
@@ -221,10 +255,9 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
 
   ROS_INFO(
       "Reconfigure Request: min_range: %f, max_range: %f, image_width: %d, "
-      "organized: %s, full_sweep: %s",
+      "organized: %s",
       config.min_range, config.max_range, config.image_width,
-      config.organized ? "True" : "False",
-      config.full_sweep ? "True" : "False");
+      config.organized ? "True" : "False");
 
   config_ = config;
   buffer_.clear();
@@ -246,9 +279,9 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
   }
 }
 
-uint64_t Decoder::ToHostTime(uint64_t dev_time) const {
-  return host_time_first_ + dev_time - sensor_time_first_;
-}
+// uint64_t Decoder::ToHostTime(uint64_t dev_time) const {
+//  return host_time_first_ + dev_time - sensor_time_first_;
+//}
 
 CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
                bool organized) {
@@ -281,8 +314,8 @@ CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
         // x = d * cos(phi) * cos(theta);
         // y = d * cos(phi) * sin(theta);
         // z = d * sin(phi)
-        const auto d = data[0];
-        const auto theta = data[2];
+        const auto d = data[RANGE];
+        const auto theta = data[AZIMUTH];
         const auto x = d * cos_phi * std::cos(theta);
         const auto y = d * cos_phi * std::sin(theta);
         const auto z = d * sin_phi;
@@ -290,7 +323,7 @@ CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
         p.x = x;
         p.y = -y;
         p.z = z;
-        p.intensity = data[1];
+        p.intensity = data[REFLECTIVITY];  // reflectivity
 
         cloud.points.push_back(p);
       }

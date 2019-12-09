@@ -3,9 +3,8 @@ ouster_ros/include
 ouster_viz/include
 ouster_viz/src
 
-/opt/ros/melodic/include
 /usr/local/include
+/usr/local/include/eigen3
+/usr/local/include/pcl-1.9
+/opt/ros/melodic/include
 ~/Workspace/ws/sv_ws/devel/include
-ouster_ros/launch
-/usr/include/pcl-1.8
-ouster_ros/cfg
