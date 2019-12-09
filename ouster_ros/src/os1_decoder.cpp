@@ -27,52 +27,31 @@ static constexpr auto kNaNF = std::numeric_limits<float>::quiet_NaN();
 static constexpr float range_factor = 0.001f;       // mm -> m
 static constexpr double kDefaultGravity = 9.81645;  // [m/s^2] in philadelphia
 
+int freq_of_lidar_mode(lidar_mode mode) {
+  switch (mode) {
+    case MODE_512x10:
+    case MODE_1024x10:
+    case MODE_2048x10:
+      return 10;
+    case MODE_512x20:
+    case MODE_1024x20:
+      return 20;
+    default:
+      throw std::invalid_argument{"freq_of_lidar_mode"};
+  }
+}
+
 /// Convert a vector of double from deg to rad
 void TransformDeg2RadInPlace(std::vector<double>& vec) {
   std::transform(vec.begin(), vec.end(), vec.begin(), deg2rad);
 }
 
 /// Convert image to point cloud
-CloudT::Ptr ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
-                    bool organized);
+CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
+               bool organized);
 
 /// Convert imu packet imu msg
-Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity) {
-  Imu m;
-  const uint8_t* buf = p.buf.data();
-
-  // Ouster provides timestamps for both the gyro and accelerometer in order to
-  // give access to the lowest level information. In most applications it is
-  // acceptable to use the average of the two timestamps.
-  const auto ts = imu_gyro_ts(buf) / 2 + imu_accel_ts(buf) / 2;
-  m.header.stamp.fromNSec(ts);
-  m.header.frame_id = frame_id;
-
-  m.orientation.x = 0;
-  m.orientation.y = 0;
-  m.orientation.z = 0;
-  m.orientation.w = 0;
-
-  m.linear_acceleration.x = imu_la_x(buf) * gravity;
-  m.linear_acceleration.y = imu_la_y(buf) * gravity;
-  m.linear_acceleration.z = imu_la_z(buf) * gravity;
-
-  m.angular_velocity.x = imu_av_x(buf) * M_PI / 180.0;
-  m.angular_velocity.y = imu_av_y(buf) * M_PI / 180.0;
-  m.angular_velocity.z = imu_av_z(buf) * M_PI / 180.0;
-
-  for (int i = 0; i < 9; i++) {
-    m.orientation_covariance[i] = -1;
-    m.angular_velocity_covariance[i] = 0;
-    m.linear_acceleration_covariance[i] = 0;
-  }
-  for (int i = 0; i < 9; i += 4) {
-    m.linear_acceleration_covariance[i] = 0.01;
-    m.angular_velocity_covariance[i] = 6e-4;
-  }
-
-  return m;
-}
+Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity);
 
 Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   // Setup reconfigure server
@@ -95,6 +74,7 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
     info_.mode = lidar_mode_of_string(cfg.lidar_mode);
     info_.hostname = cfg.hostname;
   } else {
+    // Should we even allow this?
     ROS_WARN("Calling os1 config service failed, revert to default");
     info_.beam_altitude_angles = beam_altitude_angles;
     info_.beam_azimuth_angles = beam_azimuth_angles;
@@ -104,31 +84,44 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
     info_.hostname = "UNKNOWN";
   }
 
+  // Compute firing cycle from mode, defined as the time between each firing
+  firing_cycle_ns_ =
+      1e9 / (freq_of_lidar_mode(info_.mode) * n_cols_of_lidar_mode(info_.mode));
+
   // Convert all angles to rad
   TransformDeg2RadInPlace(info_.beam_altitude_angles);
   TransformDeg2RadInPlace(info_.beam_azimuth_angles);
 
-  // frame ids
-  lidar_frame_ = pnh_.param<std::string>("cloud_frame", "os1_lidar");
-  imu_frame_ = pnh_.param<std::string>("imu_frame", "os1_imu");
-  sensor_frame_ = pnh_.param<std::string>("sensor_frame", "os1_sensor");
+  // frame ids and gravity
   gravity_ = pnh_.param<double>("gravity", kDefaultGravity);
+  imu_frame_ = pnh_.param<std::string>("imu_frame", "os1_imu");
+  lidar_frame_ = pnh_.param<std::string>("cloud_frame", "os1_lidar");
+  sensor_frame_ = pnh_.param<std::string>("sensor_frame", "os1_sensor");
+  use_host_time_ = pnh_.param<bool>("use_host_time", false);
 
   // tf
-  broadcaster_.sendTransform(transform_to_tf_msg(info_.imu_to_sensor_transform,
-                                                 sensor_frame_, imu_frame_));
   broadcaster_.sendTransform(transform_to_tf_msg(
       info_.lidar_to_sensor_transform, sensor_frame_, lidar_frame_));
+  broadcaster_.sendTransform(transform_to_tf_msg(info_.imu_to_sensor_transform,
+                                                 sensor_frame_, imu_frame_));
 
   ROS_INFO("Hostname: %s", info_.hostname.c_str());
   ROS_INFO("Lidar mode: %s", to_string(info_.mode).c_str());
   ROS_INFO("Lidar frame: %s", lidar_frame_.c_str());
   ROS_INFO("Imu frame: %s", imu_frame_.c_str());
   ROS_INFO("Gravity: %f m/s^2", gravity_);
+  ROS_INFO("Firing cycle ns: %zd ns", firing_cycle_ns_);
 }
 
 void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
-  //  ROS_DEBUG_THROTTLE(1, "Lidar packet size %zu", packet_msg.buf.size());
+  // If we use ros time, then we record the first packet time
+  if (use_host_time_ && !HostTimeReady()) {
+    host_time_first_ = ros::Time::now().toNSec();
+    sensor_time_first_ = col_timestamp(packet_msg.buf.data());
+    ROS_INFO("Record first host time %zu and sensor time %zu", host_time_first_,
+             sensor_time_first_);
+  }
+
   buffer_.push_back(packet_msg);
 
   const auto curr_width = buffer_.size() * columns_per_buffer;
@@ -144,11 +137,11 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
                           cv::Scalar(kNaNF));  // Init to all NaNs
   ROS_DEBUG("Image: %d x %d x %d", image.rows, image.cols, image.channels());
 
+  // Decode each packet
   for (int ibuf = 0; ibuf < buffer_.size(); ++ibuf) {
-    const PacketMsg& packet = buffer_[ibuf];
-    // Decode each packet
-    const uint8_t* packet_buf = packet.buf.data();
-    // Decode each azimuth block
+    const uint8_t* packet_buf = buffer_[ibuf].buf.data();
+
+    // Decode each azimuth block (16 per packet)
     for (int icol = 0; icol < columns_per_buffer; ++icol) {
       const uint8_t* col_buf = nth_col(icol, packet_buf);
       // const uint16_t m_id = col_measurement_id(col_buf);
@@ -163,7 +156,7 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
       const int col = ibuf * columns_per_buffer + icol;
       const float theta0 = col_h_angle(col_buf);  // rad
 
-      // Decode each beam
+      // Decode each beam (64 per block)
       for (uint8_t ipx = 0; ipx < pixels_per_column; ipx++) {
         const uint8_t* px_buf = nth_px(ipx, col_buf);
         const uint32_t range = px_range(px_buf);
@@ -183,7 +176,10 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   // be set to 0x0, but timestamp, measurement id, frame id, and encoder count
   // will remain valid
   // Thus we can always use the timestamp of the first packet
-  const uint64_t ts = col_timestamp(buffer_.front().buf.data());
+  uint64_t ts = col_timestamp(buffer_.front().buf.data());
+  if (use_host_time_) {
+    ts = ToHostTime(ts);
+  }
   header.stamp.fromNSec(ts);
 
   const ImagePtr image_msg =
@@ -193,6 +189,7 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   cinfo_msg->height = image_msg->height;
   cinfo_msg->width = image_msg->width;
   cinfo_msg->D = info_.beam_altitude_angles;
+  cinfo_msg->P[0] = firing_cycle_ns_;
 
   camera_pub_.publish(image_msg, cinfo_msg);
   lidar_pub_.publish(ToCloud(image_msg, *cinfo_msg, config_.organized));
@@ -201,8 +198,16 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
 }
 
 void Decoder::ImuPacketCb(const PacketMsg& packet_msg) {
-  //  ROS_DEBUG_THROTTLE(1, "Imu packet size %zu", packet.buf.size());
+  if (use_host_time_ && (host_time_first_ == 0 || sensor_time_first_ == 0)) {
+    ROS_INFO("Use ros time, waiting for the first device time");
+    return;
+  }
+
   auto imu_msg = ToImu(packet_msg, imu_frame_, gravity_);
+  if (use_host_time_) {
+    auto ts = imu_msg.header.stamp.toNSec();
+    imu_msg.header.stamp.fromNSec(ToHostTime(ts));
+  }
   imu_pub_.publish(imu_msg);
 }
 
@@ -241,10 +246,13 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
   }
 }
 
-CloudT::Ptr ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
-                    bool organized) {
-  CloudT::Ptr cloud_ptr(new CloudT);
-  CloudT& cloud = *cloud_ptr;
+uint64_t Decoder::ToHostTime(uint64_t dev_time) const {
+  return host_time_first_ + dev_time - sensor_time_first_;
+}
+
+CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
+               bool organized) {
+  CloudT cloud;
 
   const auto image = cv_bridge::toCvShare(image_msg)->image;
   const auto& altitude_angles = cinfo_msg.D;
@@ -297,7 +305,45 @@ CloudT::Ptr ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
     cloud.height = 1;
   }
 
-  return cloud_ptr;
+  return cloud;
+}
+
+Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity) {
+  Imu m;
+  const uint8_t* buf = p.buf.data();
+
+  // Ouster provides timestamps for both the gyro and accelerometer in order to
+  // give access to the lowest level information. In most applications it is
+  // acceptable to use the average of the two timestamps.
+  const auto ts = imu_gyro_ts(buf) / 2 + imu_accel_ts(buf) / 2;
+  m.header.stamp.fromNSec(ts);
+  m.header.frame_id = frame_id;
+
+  m.orientation.x = 0;
+  m.orientation.y = 0;
+  m.orientation.z = 0;
+  m.orientation.w = 0;
+
+  m.linear_acceleration.x = imu_la_x(buf) * gravity;
+  m.linear_acceleration.y = imu_la_y(buf) * gravity;
+  m.linear_acceleration.z = imu_la_z(buf) * gravity;
+
+  m.angular_velocity.x = imu_av_x(buf) * M_PI / 180.0;
+  m.angular_velocity.y = imu_av_y(buf) * M_PI / 180.0;
+  m.angular_velocity.z = imu_av_z(buf) * M_PI / 180.0;
+
+  for (int i = 0; i < 9; i++) {
+    m.orientation_covariance[i] = -1;
+    m.angular_velocity_covariance[i] = 0;
+    m.linear_acceleration_covariance[i] = 0;
+  }
+
+  for (int i = 0; i < 9; i += 4) {
+    m.linear_acceleration_covariance[i] = 0.01;
+    m.angular_velocity_covariance[i] = 6e-4;
+  }
+
+  return m;
 }
 
 }  // namespace OS1

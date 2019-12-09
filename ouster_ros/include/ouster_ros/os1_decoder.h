@@ -26,20 +26,33 @@ class Decoder {
   void ConfigCb(OusterOS1Config& config, int level);
 
  private:
+  uint64_t ToHostTime(uint64_t dev_time) const;
+  bool HostTimeReady() const {
+    return host_time_first_ > 0 && sensor_time_first_ > 0;
+  }
+
   ros::NodeHandle pnh_;
   image_transport::ImageTransport it_;
   ros::Publisher lidar_pub_, imu_pub_;
   image_transport::CameraPublisher camera_pub_;
   ros::Subscriber lidar_packet_sub_, imu_packet_sub_;
-
+  tf2_ros::StaticTransformBroadcaster broadcaster_;
   dynamic_reconfigure::Server<OusterOS1Config> server_;
   OusterOS1Config config_;
 
-  double gravity_;
+  // OS1
   ouster::OS1::sensor_info info_;
   std::vector<PacketMsg> buffer_;
+
+  // params
+  bool use_host_time_;
+  double gravity_;
   std::string lidar_frame_, imu_frame_, sensor_frame_;
-  tf2_ros::StaticTransformBroadcaster broadcaster_;
+
+  // time related
+  uint64_t firing_cycle_ns_{0};
+  uint64_t host_time_first_{0};
+  uint64_t sensor_time_first_{0};
 };
 
 }  // namespace OS1
