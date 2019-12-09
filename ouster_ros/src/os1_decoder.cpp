@@ -304,7 +304,7 @@ CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
       const cv::Vec3f& data = row_ptr[c];  // [range, reflectivity, azimuth]
 
       PointT p;
-      if (std::isnan(data[0])) {
+      if (std::isnan(data[RANGE])) {
         if (organized) {
           p.x = p.y = p.z = p.intensity = kNaNF;
           cloud.points.push_back(p);
