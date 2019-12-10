@@ -14,8 +14,10 @@
         <remap from="~lidar_packets" to="lidar_packets"/>
         <remap from="~imu_packets" to="imu_packets"/>
 
-        <remap from="~cloud" to="cloud"/>
         <remap from="~imu" to="imu"/>
+        <remap from="~cloud" to="cloud"/>
+        <remap from="~image" to="image"/>
+        <remap from="~camera_info" to="camera_info"/>
     </node>
 
 </launch>

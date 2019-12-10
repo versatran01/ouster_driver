@@ -209,8 +209,13 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   cinfo_msg->D = info_.beam_altitude_angles;
   cinfo_msg->P[0] = firing_cycle_ns_;
 
-  camera_pub_.publish(image_msg, cinfo_msg);
-  lidar_pub_.publish(ToCloud(image_msg, *cinfo_msg, config_.organized));
+  if (camera_pub_.getNumSubscribers() > 0) {
+    camera_pub_.publish(image_msg, cinfo_msg);
+  }
+
+  if (lidar_pub_.getNumSubscribers() > 0) {
+    lidar_pub_.publish(ToCloud(image_msg, *cinfo_msg, config_.organized));
+  }
 
   buffer_.clear();
 }
