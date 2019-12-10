@@ -28,7 +28,7 @@ static constexpr auto kNaNF = std::numeric_limits<float>::quiet_NaN();
 static constexpr float kRangeFactor = 0.001f;       // mm -> m
 static constexpr double kDefaultGravity = 9.81645;  // [m/s^2] in philadelphia
 
-enum Index { RANGE = 0, REFLECTIVITY = 1, AZIMUTH = 2 };
+enum Index { RANGE = 0, INTENSITY = 1, AZIMUTH = 2 };
 
 /// Get frequency from lidar mode
 int freq_of_lidar_mode(lidar_mode mode) {
@@ -99,9 +99,8 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   // frame ids and gravity
   gravity_ = pnh_.param<double>("gravity", kDefaultGravity);
   imu_frame_ = pnh_.param<std::string>("imu_frame", "os1_imu");
-  lidar_frame_ = pnh_.param<std::string>("cloud_frame", "os1_lidar");
-  sensor_frame_ = pnh_.param<std::string>("sensor_frame", "os1_sensor");
-  //  use_host_time_ = pnh_.param<bool>("use_host_time", false);
+  lidar_frame_ = pnh_.param<std::string>("lidar_frame", "os1_lidar");
+  use_intensity_ = pnh_.param<bool>("use_intensity", true);
 
   // transform
   // we assume sensor frame is aligned with lidar frame, thus lidar x is forward
@@ -115,7 +114,7 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   // <-------------o
   // y_l
   // Thus the only transform we need to publish is imu to lidar, T_L_I
-  // Fix lidar frame to be aligned with senspr frame
+  // Fix lidar frame to be aligned with sensor frame
   info_.lidar_to_sensor_transform[0] = info_.lidar_to_sensor_transform[5] = 1;
   std::vector<double> imu_to_lidar_transform(16, 0);
   using Matrix4dRow = Eigen::Matrix<double, 4, 4, Eigen::RowMajor>;
@@ -123,6 +122,7 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   const Eigen::Map<Matrix4dRow> T_S_I(info_.imu_to_sensor_transform.data());
   Eigen::Map<Matrix4dRow> T_L_I(imu_to_lidar_transform.data());
   T_L_I = T_S_L.inverse() * T_S_I;  // T_L_I = T_L_S * T_S_I
+  T_L_I.topRightCorner<3, 1>().array() *= kRangeFactor;  // to meter
 
   ROS_INFO_STREAM("T_S_L:\n" << T_S_L);
   ROS_INFO_STREAM("T_S_I:\n" << T_S_I);
@@ -130,11 +130,6 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
 
   broadcaster_.sendTransform(
       transform_to_tf_msg(imu_to_lidar_transform, lidar_frame_, imu_frame_));
-  //  broadcaster_.sendTransform(transform_to_tf_msg(
-  //      info_.lidar_to_sensor_transform, sensor_frame_, lidar_frame_));
-  //  broadcaster_.sendTransform(transform_to_tf_msg(info_.imu_to_sensor_transform,
-  //                                                 sensor_frame_,
-  //                                                 imu_frame_));
 
   ROS_INFO("Hostname: %s", info_.hostname.c_str());
   ROS_INFO("Lidar mode: %s", to_string(info_.mode).c_str());
@@ -142,18 +137,10 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   ROS_INFO("Imu frame: %s", imu_frame_.c_str());
   ROS_INFO("Gravity: %f m/s^2", gravity_);
   ROS_INFO("Firing cycle ns: %zd ns", firing_cycle_ns_);
+  ROS_INFO("Use intensity %s", use_intensity_ ? "true" : "false");
 }
 
 void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
-  // If we use ros time, then we record the first packet time
-  //  if (use_host_time_ && !HostTimeReady()) {
-  //    host_time_first_ = ros::Time::now().toNSec();
-  //    sensor_time_first_ = col_timestamp(packet_msg.buf.data());
-  //    ROS_INFO("Record first host time %zu and sensor time %zu",
-  //    host_time_first_,
-  //             sensor_time_first_);
-  //  }
-
   buffer_.push_back(packet_msg);
 
   const auto curr_width = buffer_.size() * columns_per_buffer;
@@ -197,7 +184,8 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
         auto& v = image.at<cv::Vec3f>(ipx, col);
         // we use reflectivity which is intensity scaled based on range
         v[RANGE] = range * kRangeFactor;
-        v[REFLECTIVITY] = px_reflectivity(px_buf);
+        v[INTENSITY] = use_intensity_ ? px_signal_photons(px_buf)
+                                      : px_reflectivity(px_buf);
         v[AZIMUTH] = theta0 + info_.beam_azimuth_angles[ipx];
       }
     }
@@ -210,9 +198,6 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   // will remain valid
   // Thus we can always use the timestamp of the first packet
   uint64_t ts = col_timestamp(buffer_.front().buf.data());
-  //  if (use_host_time_) {
-  //    ts = ToHostTime(ts);
-  //  }
   header.stamp.fromNSec(ts);
 
   const ImagePtr image_msg =
@@ -231,17 +216,7 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
 }
 
 void Decoder::ImuPacketCb(const PacketMsg& packet_msg) {
-  //  if (use_host_time_ && (host_time_first_ == 0 || sensor_time_first_ == 0))
-  //  {
-  //    ROS_INFO("Use ros time, waiting for the first device time");
-  //    return;
-  //  }
-
   const auto imu_msg = ToImu(packet_msg, imu_frame_, gravity_);
-  //  if (use_host_time_) {
-  //    auto ts = imu_msg.header.stamp.toNSec();
-  //    imu_msg.header.stamp.fromNSec(ToHostTime(ts));
-  //  }
   imu_pub_.publish(imu_msg);
 }
 
@@ -279,10 +254,6 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
   }
 }
 
-// uint64_t Decoder::ToHostTime(uint64_t dev_time) const {
-//  return host_time_first_ + dev_time - sensor_time_first_;
-//}
-
 CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
                bool organized) {
   CloudT cloud;
@@ -301,7 +272,7 @@ CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
     const auto sin_phi = std::sin(phi);
 
     for (int c = 0; c < image.cols; ++c) {
-      const cv::Vec3f& data = row_ptr[c];  // [range, reflectivity, azimuth]
+      const cv::Vec3f& data = row_ptr[c];
 
       PointT p;
       if (std::isnan(data[RANGE])) {
@@ -323,7 +294,7 @@ CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
         p.x = x;
         p.y = -y;
         p.z = z;
-        p.intensity = data[REFLECTIVITY];  // reflectivity
+        p.intensity = data[INTENSITY];
 
         cloud.points.push_back(p);
       }

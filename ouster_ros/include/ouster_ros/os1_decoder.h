@@ -24,11 +24,6 @@ class Decoder {
   void ConfigCb(OusterOS1Config& config, int level);
 
  private:
-  //  uint64_t ToHostTime(uint64_t dev_time) const;
-  //  bool HostTimeReady() const {
-  //    return host_time_first_ > 0 && sensor_time_first_ > 0;
-  //  }
-
   ros::NodeHandle pnh_;
   image_transport::ImageTransport it_;
   ros::Publisher lidar_pub_, imu_pub_;
@@ -43,14 +38,10 @@ class Decoder {
   std::vector<PacketMsg> buffer_;
 
   // params
-  bool use_host_time_;
+  bool use_intensity_;
   double gravity_;
-  std::string lidar_frame_, imu_frame_, sensor_frame_;
-
-  // time related
+  std::string lidar_frame_, imu_frame_;
   uint64_t firing_cycle_ns_{0};
-  //  uint64_t host_time_first_{0};
-  //  uint64_t sensor_time_first_{0};
 };
 
 }  // namespace OS1
