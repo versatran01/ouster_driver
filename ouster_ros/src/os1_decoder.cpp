@@ -1,8 +1,14 @@
-#include "ouster_ros/os1_decoder.h"
-
+#include "ouster/os1.h"
 #include "ouster/os1_util.h"
 #include "ouster_ros/OS1ConfigSrv.h"
+#include "ouster_ros/OusterOS1Config.h"
+#include "ouster_ros/PacketMsg.h"
 #include "ouster_ros/os1_ros.h"
+
+#include <dynamic_reconfigure/server.h>
+#include <image_transport/image_transport.h>
+#include <ros/ros.h>
+#include <tf2_ros/static_transform_broadcaster.h>
 
 #include <cv_bridge/cv_bridge.h>
 #include <pcl/point_types.h>
@@ -29,6 +35,42 @@ static constexpr float kRangeFactor = 0.001f;       // mm -> m
 static constexpr double kDefaultGravity = 9.81645;  // [m/s^2] in philadelphia
 
 enum Index { RANGE = 0, INTENSITY = 1, AZIMUTH = 2 };
+
+/**
+ * @brief The Decoder class
+ */
+class Decoder {
+ public:
+  explicit Decoder(const ros::NodeHandle& pnh);
+
+  Decoder(const Decoder&) = delete;
+  Decoder operator=(const Decoder&) = delete;
+
+  void LidarPacketCb(const PacketMsg& packet);
+  void ImuPacketCb(const PacketMsg& packet);
+  void ConfigCb(OusterOS1Config& config, int level);
+
+ private:
+  ros::NodeHandle pnh_;
+  image_transport::ImageTransport it_;
+  ros::Publisher lidar_pub_, imu_pub_;
+  image_transport::CameraPublisher camera_pub_;
+  image_transport::Publisher range_pub_, intensity_pub_;
+  ros::Subscriber lidar_packet_sub_, imu_packet_sub_;
+  tf2_ros::StaticTransformBroadcaster broadcaster_;
+  dynamic_reconfigure::Server<OusterOS1Config> server_;
+  OusterOS1Config config_;
+
+  // OS1
+  ouster::OS1::sensor_info info_;
+  std::vector<PacketMsg> buffer_;
+
+  // params
+  bool use_intensity_;
+  double gravity_;
+  std::string lidar_frame_, imu_frame_;
+  uint64_t firing_cycle_ns_{0};
+};
 
 /// Get frequency from lidar mode
 int freq_of_lidar_mode(lidar_mode mode) {
@@ -155,9 +197,10 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
 
   // We have enough buffer decode
   ROS_DEBUG("Got enough packets %zu", buffer_.size());
-  // [range, reflectivity, azimuth, (noise)]
-  cv::Mat image = cv::Mat(pixels_per_column, curr_width, CV_32FC3,
-                          cv::Scalar(kNaNF));  // Init to all NaNs
+  // [range, reflectivity, azimuth]
+  // Init to all NaNs
+  cv::Mat image =
+      cv::Mat(pixels_per_column, curr_width, CV_32FC3, cv::Scalar(kNaNF));
   ROS_DEBUG("Image: %d x %d x %d", image.rows, image.cols, image.channels());
   std::vector<double> azimuths;
   azimuths.reserve(image.cols);

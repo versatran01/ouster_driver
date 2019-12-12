@@ -13,10 +13,11 @@ ouster_client/src/os1_util.cpp
 ouster_ros/CMakeLists.txt
 ouster_ros/README.md
 ouster_ros/cfg/OusterOS1.cfg
-ouster_ros/include/ouster_ros/os1_decoder.h
 ouster_ros/include/ouster_ros/os1_ros.h
 ouster_ros/include/ouster_ros/point_os1.h
+ouster_ros/launch/debug.conf
 ouster_ros/launch/os1_decoder.launch
+ouster_ros/launch/os1_driver.launch
 ouster_ros/msg/PacketMsg.msg
 ouster_ros/os1.launch
 ouster_ros/package.xml
