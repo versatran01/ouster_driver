@@ -28,6 +28,7 @@ class Decoder {
   image_transport::ImageTransport it_;
   ros::Publisher lidar_pub_, imu_pub_;
   image_transport::CameraPublisher camera_pub_;
+  image_transport::Publisher range_pub_, intensity_pub_;
   ros::Subscriber lidar_packet_sub_, imu_packet_sub_;
   tf2_ros::StaticTransformBroadcaster broadcaster_;
   dynamic_reconfigure::Server<OusterOS1Config> server_;

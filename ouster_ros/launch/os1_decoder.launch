@@ -2,7 +2,7 @@
     <arg name="driver" default="os1_node"/>
     <arg name="debug" default="False"/>
     <arg name="image_width" default="1024"/>
-    <arg name="use_intensity" default="true"/>
+    <arg name="use_intensity" default="false"/>
 
     <env if="$(arg debug)" name="ROSCONSOLE_CONFIG_FILE" value="$(find ouster_ros)/launch/debug.conf"/>
 

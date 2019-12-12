@@ -56,6 +56,9 @@ CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
 /// Convert imu packet imu msg
 Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity);
 
+/// Destagger image given offsets
+cv::Mat DestaggerImage(const cv::Mat& image, const std::vector<int>& offsets);
+
 Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   // Setup reconfigure server
   server_.setCallback(boost::bind(&Decoder::ConfigCb, this, _1, _2));
@@ -99,7 +102,7 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   gravity_ = pnh_.param<double>("gravity", kDefaultGravity);
   imu_frame_ = pnh_.param<std::string>("imu_frame", "os1_imu");
   lidar_frame_ = pnh_.param<std::string>("lidar_frame", "os1_lidar");
-  use_intensity_ = pnh_.param<bool>("use_intensity", true);
+  use_intensity_ = pnh_.param<bool>("use_intensity", false);
 
   // transform
   // we assume sensor frame is aligned with lidar frame, thus lidar x is forward
@@ -154,6 +157,8 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   cv::Mat image = cv::Mat(pixels_per_column, curr_width, CV_32FC3,
                           cv::Scalar(kNaNF));  // Init to all NaNs
   ROS_DEBUG("Image: %d x %d x %d", image.rows, image.cols, image.channels());
+  std::vector<double> azimuths;
+  azimuths.reserve(image.cols);
 
   // Decode each packet
   for (int ibuf = 0; ibuf < buffer_.size(); ++ibuf) {
@@ -174,6 +179,7 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
       const int col = ibuf * columns_per_buffer + icol;
       // Add pi to theta to compensate for the lidar frame change
       const float theta0 = col_h_angle(col_buf) + M_PI;  // rad
+      azimuths.push_back(theta0);
 
       // Decode each beam (64 per block)
       for (uint8_t ipx = 0; ipx < pixels_per_column; ipx++) {
@@ -199,15 +205,21 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   uint64_t ts = col_timestamp(buffer_.front().buf.data());
   header.stamp.fromNSec(ts);
 
+  const auto offsets = get_px_offset(n_cols_of_lidar_mode(info_.mode));
   const ImagePtr image_msg =
       cv_bridge::CvImage(header, "32FC3", image).toImageMsg();
   const CameraInfoPtr cinfo_msg(new CameraInfo);
   cinfo_msg->header = header;
   cinfo_msg->height = image_msg->height;
   cinfo_msg->width = image_msg->width;
-  cinfo_msg->D = info_.beam_altitude_angles;
+  cinfo_msg->distortion_model = info_.hostname;
   cinfo_msg->P[0] = firing_cycle_ns_;
-  // TODO: cinfo_msg.D saves [altitude_angles, azimuth_angles]
+  // altitude, azimuth, azimuth offset, px offset
+  cinfo_msg->D = info_.beam_altitude_angles;
+  cinfo_msg->D.insert(cinfo_msg->D.begin(), azimuths.begin(), azimuths.end());
+  cinfo_msg->D.insert(cinfo_msg->D.begin(), info_.beam_azimuth_angles.begin(),
+                      info_.beam_azimuth_angles.end());
+  cinfo_msg->D.insert(cinfo_msg->D.begin(), offsets.begin(), offsets.end());
 
   if (camera_pub_.getNumSubscribers() > 0) {
     camera_pub_.publish(image_msg, cinfo_msg);
@@ -215,6 +227,29 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
 
   if (lidar_pub_.getNumSubscribers() > 0) {
     lidar_pub_.publish(ToCloud(image_msg, *cinfo_msg, config_.organized));
+  }
+
+  if (range_pub_.getNumSubscribers() > 0 ||
+      intensity_pub_.getNumSubscribers() > 0) {
+    // Construct range image and intensity image
+    cv::Mat fixed = DestaggerImage(image, offsets);
+
+    // Publish range and intensity separately
+    cv::Mat sep[3];
+    cv::split(fixed, sep);
+
+    cv::Mat range = sep[RANGE];
+    range.convertTo(range, CV_8UC1, 4.0);
+    range_pub_.publish(
+        cv_bridge::CvImage(header, image_encodings::MONO8, range).toImageMsg());
+
+    cv::Mat intensity = sep[INTENSITY];
+    double a, b;
+    cv::minMaxIdx(intensity, &a, &b);
+    intensity.convertTo(intensity, CV_8UC1, 255 / (b - a), 255 * a / (a - b));
+    intensity_pub_.publish(
+        cv_bridge::CvImage(header, image_encodings::MONO8, intensity)
+            .toImageMsg());
   }
 
   buffer_.clear();
@@ -255,6 +290,8 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
     imu_pub_ = pnh_.advertise<Imu>("imu", 100);
     camera_pub_ = it_.advertiseCamera("image", 10);
     lidar_pub_ = pnh_.advertise<PointCloud2>("cloud", 10);
+    range_pub_ = it_.advertise("range", 1);
+    intensity_pub_ = it_.advertise("intensity", 1);
     ROS_INFO("Decoder initialized");
   }
 }
@@ -264,7 +301,7 @@ CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
   CloudT cloud;
 
   const auto image = cv_bridge::toCvShare(image_msg)->image;
-  const auto& altitude_angles = cinfo_msg.D;
+  const auto& altitude_angles = cinfo_msg.D;  // might be unsafe
 
   cloud.header = pcl_conversions::toPCL(image_msg->header);
   cloud.reserve(image.total());
@@ -353,6 +390,33 @@ Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity) {
   }
 
   return m;
+}
+
+cv::Mat DestaggerImage(const cv::Mat& image, const std::vector<int>& offsets) {
+  // Destagger image
+  cv::Mat fixed =
+      cv::Mat(image.rows, image.cols, image.type(), cv::Scalar(kNaNF));
+
+  //  fixed.forEach<cv::Vec3f>([&offsets, &image](cv::Vec3f& pix, const int*
+  //  pos) {
+  //    const auto offset = offsets[pos[0]];
+  //    if (pos[1] < image.cols - offset) {
+  //      pix = image.at<cv::Vec3f>(pos[0], pos[1] + offset);
+  //    }
+  //  });
+
+  for (int r = 0; r < image.rows; ++r) {
+    const auto offset = offsets[r];
+
+    const auto* row_ptr_image = image.ptr<cv::Vec3f>(r);
+    auto* row_ptr_fixed = fixed.ptr<cv::Vec3f>(r);
+
+    for (int c = 0; c < image.cols - offset; ++c) {
+      row_ptr_fixed[c] = row_ptr_image[c + offset];
+    }
+  }
+
+  return fixed;
 }
 
 }  // namespace OS1
