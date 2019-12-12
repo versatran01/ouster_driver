@@ -11,7 +11,6 @@
 #include <sensor_msgs/CameraInfo.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
-#include <tf2/buffer_core.h>
 #include <Eigen/Geometry>
 
 namespace ouster_ros {
@@ -208,6 +207,7 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   cinfo_msg->width = image_msg->width;
   cinfo_msg->D = info_.beam_altitude_angles;
   cinfo_msg->P[0] = firing_cycle_ns_;
+  // TODO: cinfo_msg.D saves [altitude_angles, azimuth_angles]
 
   if (camera_pub_.getNumSubscribers() > 0) {
     camera_pub_.publish(image_msg, cinfo_msg);
@@ -246,9 +246,9 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
   // Initialization
   if (level < 0) {
     // IO
-    ROS_INFO("Initialize ROS subscriber/publisher");
+    ROS_INFO("Initializing ROS subscriber/publisher...");
     imu_packet_sub_ =
-        pnh_.subscribe("imu_packets", 100, &Decoder::ImuPacketCb, this);
+        pnh_.subscribe("imu_packets", 200, &Decoder::ImuPacketCb, this);
     lidar_packet_sub_ =
         pnh_.subscribe("lidar_packets", 2048, &Decoder::LidarPacketCb, this);
 
