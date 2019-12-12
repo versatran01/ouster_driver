@@ -216,10 +216,10 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   cinfo_msg->P[0] = firing_cycle_ns_;
   // altitude, azimuth, azimuth offset, px offset
   cinfo_msg->D = info_.beam_altitude_angles;
-  cinfo_msg->D.insert(cinfo_msg->D.begin(), azimuths.begin(), azimuths.end());
-  cinfo_msg->D.insert(cinfo_msg->D.begin(), info_.beam_azimuth_angles.begin(),
+  cinfo_msg->D.insert(cinfo_msg->D.end(), azimuths.begin(), azimuths.end());
+  cinfo_msg->D.insert(cinfo_msg->D.end(), info_.beam_azimuth_angles.begin(),
                       info_.beam_azimuth_angles.end());
-  cinfo_msg->D.insert(cinfo_msg->D.begin(), offsets.begin(), offsets.end());
+  cinfo_msg->D.insert(cinfo_msg->D.end(), offsets.begin(), offsets.end());
 
   if (camera_pub_.getNumSubscribers() > 0) {
     camera_pub_.publish(image_msg, cinfo_msg);
