@@ -38,6 +38,30 @@ enum Index { RANGE = 0, INTENSITY = 1, AZIMUTH = 2 };
 
 /**
  * @brief The Decoder class
+ * The decoder class subscribes to lidar packets and imu packets and publishes
+ * image, camera info, imu messages and tf from imu to lidar.
+ *
+ * Transform:
+ * There will be no sensor frame, just imu and lidar frame, where lidar frame
+ * is rotated by 180 degrees from the original lidar frame, so that x is
+ * pointing forward.
+ * Imu frame is thus aligned in orientation with lidar frame, and has a
+ * transaltional offset.
+ *
+ * Image:
+ * Decoded lidar packets are stored in sensor_msgs::Image. This image is a
+ * 3-channel float image. The channels are [range, intensity, azimuth]. Each
+ * column is one measurement taken at the same time (but not at the same azimuth
+ * angle). This means that this image is staggered.
+ *
+ * Camera Info:
+ * Auxillary information is stored in sensor_msgs::CameraInfo. The time between
+ * two measurements is in P[0]. D stores concat([beam_altitude_angles (64),
+ * encoder_azimuth_angles (col), beam_azimuth_angles (64), px_offsets (64)]).
+ *
+ * Params:
+ * See class member variables and rqt_reconfigure.
+ * You mostly need image_width.
  */
 class Decoder {
  public:
@@ -66,10 +90,10 @@ class Decoder {
   std::vector<PacketMsg> buffer_;
 
   // params
-  bool use_intensity_;
-  double gravity_;
+  bool use_intensity_;           // true - intensity, false - reflectivity
+  double gravity_;               // gravity magnitude m/s^2
+  uint64_t firing_cycle_ns_{0};  // time ns between two measurements
   std::string lidar_frame_, imu_frame_;
-  uint64_t firing_cycle_ns_{0};
 };
 
 /// Get frequency from lidar mode
@@ -332,7 +356,7 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
     imu_packet_sub_ =
         pnh_.subscribe("imu_packets", 200, &Decoder::ImuPacketCb, this);
     lidar_packet_sub_ =
-        pnh_.subscribe("lidar_packets", 2048, &Decoder::LidarPacketCb, this);
+        pnh_.subscribe("lidar_packets", 256, &Decoder::LidarPacketCb, this);
 
     imu_pub_ = pnh_.advertise<Imu>("imu", 100);
     camera_pub_ = it_.advertiseCamera("image", 10);
