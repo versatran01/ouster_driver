@@ -143,6 +143,7 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
 }
 
 void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
+  const auto start = ros::Time::now();
   buffer_.push_back(packet_msg);
 
   const auto curr_width = buffer_.size() * columns_per_buffer;
@@ -152,7 +153,7 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   }
 
   // We have enough buffer decode
-  ROS_DEBUG("Got enough packets %zu, ready to publish", buffer_.size());
+  ROS_DEBUG("Got enough packets %zu", buffer_.size());
   // [range, reflectivity, azimuth, (noise)]
   cv::Mat image = cv::Mat(pixels_per_column, curr_width, CV_32FC3,
                           cv::Scalar(kNaNF));  // Init to all NaNs
@@ -253,6 +254,7 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   }
 
   buffer_.clear();
+  ROS_DEBUG("Total time: %f", (ros::Time::now() - start).toSec());
 }
 
 void Decoder::ImuPacketCb(const PacketMsg& packet_msg) {
