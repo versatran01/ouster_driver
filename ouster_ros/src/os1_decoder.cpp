@@ -23,6 +23,7 @@ using CloudT = pcl::PointCloud<PointT>;
 
 static constexpr double deg2rad(double deg) { return deg * M_PI / 180.0; }
 static constexpr double rad2deg(double rad) { return rad * 180.0 / M_PI; }
+static constexpr float kTau = 2 * M_PI;
 static constexpr auto kNaNF = std::numeric_limits<float>::quiet_NaN();
 static constexpr float kRangeFactor = 0.001f;       // mm -> m
 static constexpr double kDefaultGravity = 9.81645;  // [m/s^2] in philadelphia
@@ -179,7 +180,8 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
 
       const int col = ibuf * columns_per_buffer + icol;
       // Add pi to theta to compensate for the lidar frame change
-      const float theta0 = col_h_angle(col_buf) + M_PI;  // rad
+      float theta0 = col_h_angle(col_buf) + M_PI;  // rad
+      if (theta0 >= kTau) theta0 -= kTau;          // make sure within [0, 2pi)
       azimuths.push_back(theta0);
 
       // Decode each beam (64 per block)
