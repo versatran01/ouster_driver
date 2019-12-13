@@ -61,7 +61,6 @@ enum Index { RANGE = 0, INTENSITY = 1, AZIMUTH = 2 };
  *
  * Params:
  * See class member variables and rqt_reconfigure.
- * You mostly need image_width.
  */
 class Decoder {
  public:
@@ -97,19 +96,7 @@ class Decoder {
 };
 
 /// Get frequency from lidar mode
-int freq_of_lidar_mode(lidar_mode mode) {
-  switch (mode) {
-    case MODE_512x10:
-    case MODE_1024x10:
-    case MODE_2048x10:
-      return 10;
-    case MODE_512x20:
-    case MODE_1024x20:
-      return 20;
-    default:
-      throw std::invalid_argument{"freq_of_lidar_mode"};
-  }
-}
+int freq_of_lidar_mode(lidar_mode mode);
 
 /// Convert a vector of double from deg to rad
 void TransformDeg2RadInPlace(std::vector<double>& vec) {
@@ -127,9 +114,6 @@ Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity);
 cv::Mat DestaggerImage(const cv::Mat& image, const std::vector<int>& offsets);
 
 Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
-  // Setup reconfigure server
-  server_.setCallback(boost::bind(&Decoder::ConfigCb, this, _1, _2));
-
   // Call service to retrieve sensor information
   OS1ConfigSrv os1_srv;
   auto client = pnh_.serviceClient<ouster_ros::OS1ConfigSrv>("os1_config");
@@ -207,6 +191,9 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   ROS_INFO("Gravity: %f m/s^2", gravity_);
   ROS_INFO("Firing cycle ns: %zd ns", firing_cycle_ns_);
   ROS_INFO("Use intensity %s", use_intensity_ ? "true" : "false");
+
+  // Setup reconfigure server
+  server_.setCallback(boost::bind(&Decoder::ConfigCb, this, _1, _2));
 }
 
 void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
@@ -335,15 +322,20 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
   // min_range should <= max_range
   config.min_range = std::min(config.min_range, config.max_range);
 
-  // image_width is a multiple of columns_per_buffer
-  config.image_width /= columns_per_buffer;
-  config.image_width *= columns_per_buffer;
+  if (config.full_sweep) {
+    config.image_width = n_cols_of_lidar_mode(info_.mode);
+  } else {
+    // image_width is a multiple of columns_per_buffer
+    config.image_width /= columns_per_buffer;
+    config.image_width *= columns_per_buffer;
+  }
 
   ROS_INFO(
       "Reconfigure Request: min_range: %f, max_range: %f, image_width: %d, "
-      "organized: %s",
+      "organized: %s, full_sweep: %s",
       config.min_range, config.max_range, config.image_width,
-      config.organized ? "True" : "False");
+      config.organized ? "True" : "False",
+      config.full_sweep ? "True" : "False");
 
   config_ = config;
   buffer_.clear();
@@ -488,6 +480,20 @@ cv::Mat DestaggerImage(const cv::Mat& image, const std::vector<int>& offsets) {
   }
 
   return fixed;
+}
+
+int freq_of_lidar_mode(lidar_mode mode) {
+  switch (mode) {
+    case MODE_512x10:
+    case MODE_1024x10:
+    case MODE_2048x10:
+      return 10;
+    case MODE_512x20:
+    case MODE_1024x20:
+      return 20;
+    default:
+      throw std::invalid_argument{"freq_of_lidar_mode"};
+  }
 }
 
 }  // namespace OS1

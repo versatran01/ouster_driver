@@ -3,12 +3,14 @@
     <arg name="debug" default="false"/>
     <arg name="image_width" default="1024"/>
     <arg name="use_intensity" default="false"/>
+    <arg name="full_sweep" default="true"/>
 
     <env if="$(arg debug)" name="ROSCONSOLE_CONFIG_FILE" value="$(find ouster_ros)/launch/debug.conf"/>
 
     <node pkg="ouster_ros" type="os1_decoder" name="os1_decoder" output="screen" ns="$(arg driver)">
         <param name="image_width" type="int" value="$(arg image_width)"/>
         <param name="use_intensity" type="bool" value="$(arg use_intensity)"/>
+        <param name="full_sweep" type="bool" value="$(arg full_sweep)"/>
 
         <remap from="~os1_config" to="os1_config"/>
         <remap from="~lidar_packets" to="lidar_packets"/>
