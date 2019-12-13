@@ -31,6 +31,7 @@ static constexpr double deg2rad(double deg) { return deg * M_PI / 180.0; }
 static constexpr double rad2deg(double rad) { return rad * 180.0 / M_PI; }
 static constexpr float kTau = 2 * M_PI;
 static constexpr auto kNaNF = std::numeric_limits<float>::quiet_NaN();
+static constexpr auto kNaND = std::numeric_limits<double>::quiet_NaN();
 static constexpr float kRangeFactor = 0.001f;       // mm -> m
 static constexpr double kDefaultGravity = 9.81645;  // [m/s^2] in philadelphia
 
@@ -69,11 +70,16 @@ class Decoder {
   Decoder(const Decoder&) = delete;
   Decoder operator=(const Decoder&) = delete;
 
-  void LidarPacketCb(const PacketMsg& packet);
-  void ImuPacketCb(const PacketMsg& packet);
+  void LidarPacketCb(const PacketMsg& packet_msg);
+  void ImuPacketCb(const PacketMsg& packet_buf);
   void ConfigCb(OusterOS1Config& config, int level);
 
  private:
+  /// Reset cached image, azimuths, timestamps and curr_col
+  void Reset();
+  /// Decode a single packet
+  void DecodeAndFill(const uint8_t* const packet);
+
   ros::NodeHandle pnh_;
   image_transport::ImageTransport it_;
   ros::Publisher lidar_pub_, imu_pub_;
@@ -86,7 +92,10 @@ class Decoder {
 
   // OS1
   ouster::OS1::sensor_info info_;
-  std::vector<PacketMsg> buffer_;
+  std::vector<double> azimuths_;
+  std::vector<uint64_t> timestamps_;
+  cv::Mat image_;    // image to fill
+  int curr_col_{0};  // current column
 
   // params
   bool use_intensity_;           // true - intensity, false - reflectivity
@@ -198,86 +207,42 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
 
 void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   const auto start = ros::Time::now();
-  buffer_.push_back(packet_msg);
 
-  const auto curr_width = buffer_.size() * columns_per_buffer;
+  // Once we get a packet, just going to decoede it and fill in right away
+  DecodeAndFill(packet_msg.buf.data());
 
-  if (curr_width < config_.image_width) {
+  if (curr_col_ < config_.image_width) {
+    // Noop if we didn't reach the required width
     return;
   }
 
-  // We have enough buffer decode
-  ROS_DEBUG("Got enough packets %zu", buffer_.size());
-  // [range, reflectivity, azimuth]
-  // Init to all NaNs
-  cv::Mat image =
-      cv::Mat(pixels_per_column, curr_width, CV_32FC3, cv::Scalar(kNaNF));
-  ROS_DEBUG("Image: %d x %d x %d", image.rows, image.cols, image.channels());
-  std::vector<double> azimuths;
-  azimuths.reserve(image.cols);
-
-  // Decode each packet
-  for (int ibuf = 0; ibuf < buffer_.size(); ++ibuf) {
-    const uint8_t* packet_buf = buffer_[ibuf].buf.data();
-
-    // Decode each azimuth block (16 per packet)
-    for (int icol = 0; icol < columns_per_buffer; ++icol) {
-      const uint8_t* col_buf = nth_col(icol, packet_buf);
-      // const uint16_t m_id = col_measurement_id(col_buf);
-      const bool valid = col_valid(col_buf) == 0xffffffff;
-
-      // drop invalid data in case of misconfiguration
-      if (!valid) {
-        ROS_DEBUG("Got invalid data block");
-        continue;
-      }
-
-      const int col = ibuf * columns_per_buffer + icol;
-      // Add pi to theta to compensate for the lidar frame change
-      float theta0 = col_h_angle(col_buf) + M_PI;  // rad
-      if (theta0 >= kTau) theta0 -= kTau;          // make sure within [0, 2pi)
-      azimuths.push_back(theta0);
-
-      // Decode each beam (64 per block)
-      for (uint8_t ipx = 0; ipx < pixels_per_column; ipx++) {
-        const uint8_t* px_buf = nth_px(ipx, col_buf);
-        const uint32_t range = px_range(px_buf);
-
-        auto& v = image.at<cv::Vec3f>(ipx, col);
-        // we use reflectivity which is intensity scaled based on range
-        v[RANGE] = range * kRangeFactor;
-        v[INTENSITY] = use_intensity_ ? px_signal_photons(px_buf)
-                                      : px_reflectivity(px_buf);
-        v[AZIMUTH] = theta0 + info_.beam_azimuth_angles[ipx];
-      }
-    }
-  }
-
+  // p.20 If the azimuth data block status is bad, words in the data block
+  // will be set to 0x0, but timestamp, measurement id, frame id, and encoder
+  // count will remain valid Thus we can always use the timestamp of the first
+  // packet
   std_msgs::Header header;
   header.frame_id = lidar_frame_;
-  // p.20 If the azimuth data block status is bad, words in the data block will
-  // be set to 0x0, but timestamp, measurement id, frame id, and encoder count
-  // will remain valid
-  // Thus we can always use the timestamp of the first packet
-  uint64_t ts = col_timestamp(buffer_.front().buf.data());
-  header.stamp.fromNSec(ts);
+  header.stamp.fromNSec(timestamps_.front());
 
   const auto offsets = get_px_offset(n_cols_of_lidar_mode(info_.mode));
   const ImagePtr image_msg =
-      cv_bridge::CvImage(header, "32FC3", image).toImageMsg();
+      cv_bridge::CvImage(header, "32FC3", image_).toImageMsg();
+
+  // Fill in camera info
   const CameraInfoPtr cinfo_msg(new CameraInfo);
   cinfo_msg->header = header;
   cinfo_msg->height = image_msg->height;
   cinfo_msg->width = image_msg->width;
   cinfo_msg->distortion_model = info_.hostname;
-  cinfo_msg->P[0] = firing_cycle_ns_;
-  // altitude, azimuth, azimuth offset, px offset
+  cinfo_msg->P[0] = firing_cycle_ns_;  // delta time between two measurements
+  // D = [altitude, azimuth, azimuth offset, px offset]
   cinfo_msg->D = info_.beam_altitude_angles;
-  cinfo_msg->D.insert(cinfo_msg->D.end(), azimuths.begin(), azimuths.end());
+  cinfo_msg->D.insert(cinfo_msg->D.end(), azimuths_.begin(), azimuths_.end());
   cinfo_msg->D.insert(cinfo_msg->D.end(), info_.beam_azimuth_angles.begin(),
                       info_.beam_azimuth_angles.end());
   cinfo_msg->D.insert(cinfo_msg->D.end(), offsets.begin(), offsets.end());
 
+  // Publish on demand
   if (camera_pub_.getNumSubscribers() > 0) {
     camera_pub_.publish(image_msg, cinfo_msg);
   }
@@ -289,17 +254,19 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   if (range_pub_.getNumSubscribers() > 0 ||
       intensity_pub_.getNumSubscribers() > 0) {
     // Construct range image and intensity image
-    cv::Mat fixed = DestaggerImage(image, offsets);
+    cv::Mat fixed = DestaggerImage(image_, offsets);
 
     // Publish range and intensity separately
     cv::Mat sep[3];
     cv::split(fixed, sep);
 
     cv::Mat range = sep[RANGE];
-    range.convertTo(range, CV_8UC1, 4.0);
+    // should be 2, use 3 for more contrast
+    range.convertTo(range, CV_8UC1, 3.0);
     range_pub_.publish(
         cv_bridge::CvImage(header, image_encodings::MONO8, range).toImageMsg());
 
+    // use 300 for more contrast
     cv::Mat intensity = sep[INTENSITY];
     double a, b;
     cv::minMaxIdx(intensity, &a, &b);
@@ -309,7 +276,8 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
             .toImageMsg());
   }
 
-  buffer_.clear();
+  // Don't forget to reset
+  Reset();
   ROS_DEBUG("Total time: %f", (ros::Time::now() - start).toSec());
 }
 
@@ -338,8 +306,7 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
       config.full_sweep ? "True" : "False");
 
   config_ = config;
-  buffer_.clear();
-  buffer_.reserve(config_.image_width);
+  Reset();
 
   // Initialization
   if (level < 0) {
@@ -356,6 +323,50 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
     range_pub_ = it_.advertise("range", 1);
     intensity_pub_ = it_.advertise("intensity", 1);
     ROS_INFO("Decoder initialized");
+  }
+}
+
+void Decoder::Reset() {
+  curr_col_ = 0;
+  image_ = cv::Mat(pixels_per_column, config_.image_width, CV_32FC3,
+                   cv::Scalar(kNaNF));
+  azimuths_.clear();
+  azimuths_.resize(config_.image_width, kNaND);
+  timestamps_.clear();
+  timestamps_.resize(config_.image_width, 0);
+}
+
+void Decoder::DecodeAndFill(const uint8_t* const packet_buf) {
+  // Decode each azimuth block (16 per packet)
+  for (int icol = 0; icol < columns_per_buffer; ++icol, ++curr_col_) {
+    const uint8_t* col_buf = nth_col(icol, packet_buf);
+    // const uint16_t m_id = col_measurement_id(col_buf);
+    const bool valid = col_valid(col_buf) == 0xffffffff;
+
+    // drop invalid data in case of misconfiguration
+    if (!valid) {
+      ROS_DEBUG("Got invalid data block");
+      continue;
+    }
+
+    // Add pi to theta to compensate for the lidar frame change
+    float theta0 = col_h_angle(col_buf) + M_PI;  // rad
+    if (theta0 >= kTau) theta0 -= kTau;          // make sure within [0, 2pi)
+    azimuths_[curr_col_] = theta0;
+    timestamps_[curr_col_] = col_timestamp(col_buf);
+
+    // Decode each beam (64 per block)
+    for (uint8_t ipx = 0; ipx < pixels_per_column; ++ipx) {
+      const uint8_t* px_buf = nth_px(ipx, col_buf);
+      const uint32_t range = px_range(px_buf);
+
+      auto& v = image_.at<cv::Vec3f>(ipx, curr_col_);
+      // we use reflectivity which is intensity scaled based on range
+      v[RANGE] = range * kRangeFactor;
+      v[INTENSITY] =
+          use_intensity_ ? px_signal_photons(px_buf) : px_reflectivity(px_buf);
+      v[AZIMUTH] = theta0 + info_.beam_azimuth_angles[ipx];
+    }
   }
 }
 
