@@ -65,7 +65,7 @@ enum Index { RANGE = 0, INTENSITY = 1, AZIMUTH = 2, NOISE = 3 };
  * is rotated by 180 degrees from the original lidar frame, so that x is
  * pointing forward.
  * Imu frame is thus aligned in orientation with lidar frame, and has a
- * transaltional offset.
+ * translational offset.
  *
  * Image:
  * Decoded lidar packets are stored in sensor_msgs::Image. This image is a
