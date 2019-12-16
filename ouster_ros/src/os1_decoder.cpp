@@ -1,29 +1,28 @@
-#include "ouster/os1.h"
 #include "ouster/os1_util.h"
-#include "ouster_ros/OS1ConfigSrv.h"
-#include "ouster_ros/OusterOS1Config.h"
 #include "ouster_ros/PacketMsg.h"
 #include "ouster_ros/os1_ros.h"
 
-#include <dynamic_reconfigure/server.h>
-#include <image_transport/image_transport.h>
-#include <ros/ros.h>
-#include <tf2_ros/static_transform_broadcaster.h>
+#include "ouster_ros/OS1ConfigSrv.h"
+#include "ouster_ros/OusterOS1Config.h"
 
 #include <cv_bridge/cv_bridge.h>
-#include <pcl/point_types.h>
+#include <dynamic_reconfigure/server.h>
+#include <image_transport/image_transport.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl_ros/point_cloud.h>
 #include <sensor_msgs/CameraInfo.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
+#include <tf2_ros/static_transform_broadcaster.h>
+
+#include <pcl/point_types.h>
 #include <Eigen/Geometry>
 
 namespace ouster_ros {
 namespace OS1 {
 
 using namespace ouster::OS1;
-using namespace sensor_msgs;
+using namespace sensor_msgs;  // Image, CameraInfo, Imu
 using PointT = pcl::PointXYZI;
 using CloudT = pcl::PointCloud<PointT>;
 
@@ -35,7 +34,26 @@ static constexpr auto kNaND = std::numeric_limits<double>::quiet_NaN();
 static constexpr float kRangeFactor = 0.001f;       // mm -> m
 static constexpr double kDefaultGravity = 9.81645;  // [m/s^2] in philadelphia
 
-enum Index { RANGE = 0, INTENSITY = 1, AZIMUTH = 2 };
+/// Get frequency from lidar mode
+int freq_of_lidar_mode(lidar_mode mode);
+
+/// Convert a vector of double from deg to rad
+void TransformDeg2RadInPlace(std::vector<double>& vec) {
+  std::transform(vec.begin(), vec.end(), vec.begin(), deg2rad);
+}
+
+/// Convert image to point cloud
+CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
+               bool organized);
+
+/// Convert imu packet imu msg
+Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity);
+
+/// Destagger image given offsets
+cv::Mat DestaggerImage(const cv::Mat& image, const std::vector<int>& offsets);
+
+/// Used for indexing into packet and image, (NOISE not used now)
+enum Index { RANGE = 0, INTENSITY = 1, AZIMUTH = 2, NOISE = 3 };
 
 /**
  * @brief The Decoder class
@@ -80,6 +98,7 @@ class Decoder {
   /// Decode a single packet
   void DecodeAndFill(const uint8_t* const packet);
 
+  // ros
   ros::NodeHandle pnh_;
   image_transport::ImageTransport it_;
   ros::Publisher lidar_pub_, imu_pub_;
@@ -91,11 +110,11 @@ class Decoder {
   OusterOS1Config config_;
 
   // OS1
-  ouster::OS1::sensor_info info_;
-  std::vector<double> azimuths_;
-  std::vector<uint64_t> timestamps_;
-  cv::Mat image_;    // image to fill
-  int curr_col_{0};  // current column
+  sensor_info info_;                  // from os1
+  std::vector<uint64_t> timestamps_;  // timestamps of each col
+  std::vector<double> azimuths_;      // nomial azimuth of each col (no offset)
+  cv::Mat image_;                     // image to fill with packets
+  int curr_col_{0};                   // tracks current column
 
   // params
   bool use_intensity_;           // true - intensity, false - reflectivity
@@ -104,26 +123,8 @@ class Decoder {
   std::string lidar_frame_, imu_frame_;
 };
 
-/// Get frequency from lidar mode
-int freq_of_lidar_mode(lidar_mode mode);
-
-/// Convert a vector of double from deg to rad
-void TransformDeg2RadInPlace(std::vector<double>& vec) {
-  std::transform(vec.begin(), vec.end(), vec.begin(), deg2rad);
-}
-
-/// Convert image to point cloud
-CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
-               bool organized);
-
-/// Convert imu packet imu msg
-Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity);
-
-/// Destagger image given offsets
-cv::Mat DestaggerImage(const cv::Mat& image, const std::vector<int>& offsets);
-
 Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
-  // Call service to retrieve sensor information
+  // Call service to retrieve sensor information, this must be done first
   OS1ConfigSrv os1_srv;
   auto client = pnh_.serviceClient<ouster_ros::OS1ConfigSrv>("os1_config");
   client.waitForExistence();
@@ -151,6 +152,7 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   }
 
   // Compute firing cycle from mode, defined as the time between each firing
+  // dt = 1s / (freq * width)
   firing_cycle_ns_ =
       1e9 / (freq_of_lidar_mode(info_.mode) * n_cols_of_lidar_mode(info_.mode));
 
@@ -165,6 +167,7 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   use_intensity_ = pnh_.param<bool>("use_intensity", false);
 
   // transform
+  // Original os1 lidar frame is 180 from sensor frame, this is awkward.
   // we assume sensor frame is aligned with lidar frame, thus lidar x is forward
   // and lidar y points left. This also means that imu is now aligned with lidar
   // with only a translational offset
@@ -175,9 +178,11 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   //               |
   // <-------------o
   // y_l
+
   // Thus the only transform we need to publish is imu to lidar, T_L_I
   // Fix lidar frame to be aligned with sensor frame
   info_.lidar_to_sensor_transform[0] = info_.lidar_to_sensor_transform[5] = 1;
+
   std::vector<double> imu_to_lidar_transform(16, 0);
   using Matrix4dRow = Eigen::Matrix<double, 4, 4, Eigen::RowMajor>;
   const Eigen::Map<Matrix4dRow> T_S_L(info_.lidar_to_sensor_transform.data());
@@ -209,6 +214,7 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   const auto start = ros::Time::now();
 
   // Once we get a packet, just going to decoede it and fill in right away
+  // This will fill data into image, azimuths, timestamps and update curr_col
   DecodeAndFill(packet_msg.buf.data());
 
   if (curr_col_ < config_.image_width) {
@@ -224,6 +230,7 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   header.frame_id = lidar_frame_;
   header.stamp.fromNSec(timestamps_.front());
 
+  // Pixel offsets used to destagger image
   const auto offsets = get_px_offset(n_cols_of_lidar_mode(info_.mode));
   const ImagePtr image_msg =
       cv_bridge::CvImage(header, "32FC3", image_).toImageMsg();
@@ -351,7 +358,11 @@ void Decoder::DecodeAndFill(const uint8_t* const packet_buf) {
 
     // Add pi to theta to compensate for the lidar frame change
     float theta0 = col_h_angle(col_buf) + M_PI;  // rad
-    if (theta0 >= kTau) theta0 -= kTau;          // make sure within [0, 2pi)
+
+    // make sure theta \in [0, 2pi), always >=0 so no need to check the other
+    // way
+    if (theta0 >= kTau) theta0 -= kTau;
+
     azimuths_[curr_col_] = theta0;
     timestamps_[curr_col_] = col_timestamp(col_buf);
 
@@ -432,6 +443,7 @@ Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity) {
   Imu m;
   const uint8_t* buf = p.buf.data();
 
+  // From software manual 1.13
   // Ouster provides timestamps for both the gyro and accelerometer in order to
   // give access to the lowest level information. In most applications it is
   // acceptable to use the average of the two timestamps.
@@ -471,6 +483,9 @@ cv::Mat DestaggerImage(const cv::Mat& image, const std::vector<int>& offsets) {
   cv::Mat fixed =
       cv::Mat(image.rows, image.cols, image.type(), cv::Scalar(kNaNF));
 
+  // This opencv forEach is sometimes slower? Possibly due to the if in the
+  // lambda??
+
   //  fixed.forEach<cv::Vec3f>([&offsets, &image](cv::Vec3f& pix, const int*
   //  pos) {
   //    const auto offset = offsets[pos[0]];
@@ -478,6 +493,19 @@ cv::Mat DestaggerImage(const cv::Mat& image, const std::vector<int>& offsets) {
   //      pix = image.at<cv::Vec3f>(pos[0], pos[1] + offset);
   //    }
   //  });
+
+  // The staggered image looks like this (assume offset 3n)
+  // alphabet is a laser and number is time
+  // | a1 | a2 | a3 | a4 | a5 | a6 | a7 | a8 | a9 | a10| a11| a12| a13|
+  //                | b1 | b2 | b3 | b4 | b5 | b6 | b7 | b8 | b9 | b10|
+  //                               | c1 | c2 | c3 | c4 | c5 | c6 | c7 |
+  //                                                d1 | d2 | d3 | d4 |
+
+  // The destaggered image looks like (shift to left by 3n)
+  // | a1 | a2 | a3 | a4 | a5 | a6 | a7 | a8 | a9 | a10| a11| a12| a13|
+  // | b1 | b2 | b3 | b4 | b5 | b6 | b7 | b8 | b9 | b10|
+  // | c1 | c2 | c3 | c4 | c5 | c6 | c7 |
+  // | d1 | d2 | d3 | d4 |
 
   for (int r = 0; r < image.rows; ++r) {
     const auto offset = offsets[r];
