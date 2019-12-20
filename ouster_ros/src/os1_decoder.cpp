@@ -172,10 +172,10 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   // and lidar y points left. This also means that imu is now aligned with lidar
   // with only a translational offset
   //               ^ x_l
-  //        x_i^   |
-  //           |   |
-  // y_i <-----o   |
-  //               |
+  //        x_i^   | -> /
+  //           |   | a /
+  // y_i <-----o   |  /
+  //               | /
   // <-------------o
   // y_l
 
