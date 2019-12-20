@@ -232,8 +232,9 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
 
   // Pixel offsets used to destagger image
   const auto offsets = get_px_offset(n_cols_of_lidar_mode(info_.mode));
+  const cv::Mat fixed = DestaggerImage(image_, offsets);
   const ImagePtr image_msg =
-      cv_bridge::CvImage(header, "32FC3", image_).toImageMsg();
+      cv_bridge::CvImage(header, "32FC3", fixed).toImageMsg();
 
   // Fill in camera info
   const CameraInfoPtr cinfo_msg(new CameraInfo);
@@ -260,9 +261,6 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
 
   if (range_pub_.getNumSubscribers() > 0 ||
       intensity_pub_.getNumSubscribers() > 0) {
-    // Construct range image and intensity image
-    cv::Mat fixed = DestaggerImage(image_, offsets);
-
     // Publish range and intensity separately
     cv::Mat sep[3];
     cv::split(fixed, sep);
@@ -494,18 +492,23 @@ cv::Mat DestaggerImage(const cv::Mat& image, const std::vector<int>& offsets) {
   //    }
   //  });
 
-  // The staggered image looks like this (assume offset 3n)
-  // alphabet is a laser and number is time
-  // | a1 | a2 | a3 | a4 | a5 | a6 | a7 | a8 | a9 | a10| a11| a12| a13|
-  //                | b1 | b2 | b3 | b4 | b5 | b6 | b7 | b8 | b9 | b10|
-  //                               | c1 | c2 | c3 | c4 | c5 | c6 | c7 |
-  //                                                d1 | d2 | d3 | d4 |
+  // alphabet is a laser beam and number is time
+  // The staggered image looks like this
+  // | a1 | a2 | a3 | a4 | a5 | a6 |
+  // | b1 | b2 | b3 | b4 | b5 | b6 |
+  // | c1 | c2 | c3 | c4 | c5 | c6 |
+  // | d1 | d2 | d3 | d4 | d5 | d6 |
 
-  // The destaggered image looks like (shift to left by 3n)
-  // | a1 | a2 | a3 | a4 | a5 | a6 | a7 | a8 | a9 | a10| a11| a12| a13|
-  // | b1 | b2 | b3 | b4 | b5 | b6 | b7 | b8 | b9 | b10|
-  // | c1 | c2 | c3 | c4 | c5 | c6 | c7 |
-  // | d1 | d2 | d3 | d4 |
+  // The destaggered image looks like
+  // | a1 | a2 | a3 | a4 | a5 | a6 |
+  // | b2 | b3 | b4 | b5 | b6 |
+  // | c3 | c4 | c5 | c6 |
+  // | d4 | d5 | d6 |
+
+  // This means on client side, when an image arrives, one can directly
+  // visualize the image and it would look normal (not staggered).
+  // Each column roughly corresponds to the same azimuth angle.
+  // To get the actual measurement id, add corresponding offset to the column
 
   for (int r = 0; r < image.rows; ++r) {
     const auto offset = offsets[r];
