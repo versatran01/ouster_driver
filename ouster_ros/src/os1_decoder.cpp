@@ -189,7 +189,6 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   const Eigen::Map<Matrix4dRow> T_S_I(info_.imu_to_sensor_transform.data());
   Eigen::Map<Matrix4dRow> T_L_I(imu_to_lidar_transform.data());
   T_L_I = T_S_L.inverse() * T_S_I;  // T_L_I = T_L_S * T_S_I
-  T_L_I.topRightCorner<3, 1>().array() *= kRangeFactor;  // to meter
 
   ROS_INFO_STREAM("T_S_L:\n" << T_S_L);
   ROS_INFO_STREAM("T_S_I:\n" << T_S_I);
