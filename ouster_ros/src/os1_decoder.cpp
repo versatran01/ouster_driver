@@ -292,9 +292,6 @@ void Decoder::ImuPacketCb(const PacketMsg& packet_msg) {
 }
 
 void Decoder::ConfigCb(OusterOS1Config& config, int level) {
-  // min_range should <= max_range
-  config.min_range = std::min(config.min_range, config.max_range);
-
   if (config.full_sweep) {
     config.image_width = n_cols_of_lidar_mode(info_.mode);
   } else {
@@ -304,10 +301,8 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
   }
 
   ROS_INFO(
-      "Reconfigure Request: min_range: %f, max_range: %f, image_width: %d, "
-      "organized: %s, full_sweep: %s",
-      config.min_range, config.max_range, config.image_width,
-      config.organized ? "True" : "False",
+      "Reconfigure Request: image_width: %d, organized: %s, full_sweep: %s",
+      config.image_width, config.organized ? "True" : "False",
       config.full_sweep ? "True" : "False");
 
   config_ = config;
