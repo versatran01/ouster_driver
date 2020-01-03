@@ -1,5 +1,5 @@
 <launch>
-    <arg name="ns_in" default="os1_node"/>
+    <arg name="ns_in" default="/os1_node"/>
     <arg name="ns_out" default="$(arg ns_in)"/>
 
     <arg name="lidar_frame" default="lidar"/>

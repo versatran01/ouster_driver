@@ -49,8 +49,8 @@ CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
 /// Convert imu packet imu msg
 Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity);
 
-/// Destagger image given offsets
-cv::Mat DestaggerImage(const cv::Mat& image, const std::vector<int>& offsets);
+/// Compute average delta azimuth
+double ComputeDeltaAzimuth(const std::vector<double>& azimuths);
 
 /// Used for indexing into packet and image, (NOISE not used now)
 enum Index { RANGE = 0, INTENSITY = 1, AZIMUTH = 2, NOISE = 3 };
@@ -97,6 +97,7 @@ class Decoder {
   void Reset();
   /// Decode a single packet
   void DecodeAndFill(const uint8_t* const packet);
+  cv::Mat DestaggerImage(const cv::Mat& image, const std::vector<int>& offsets);
 
   // ros
   ros::NodeHandle pnh_;
@@ -241,7 +242,9 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   cinfo_msg->height = image_msg->height;
   cinfo_msg->width = image_msg->width;
   cinfo_msg->distortion_model = info_.hostname;
-  cinfo_msg->P[0] = firing_cycle_ns_;  // delta time between two measurements
+  cinfo_msg->K[0] = firing_cycle_ns_;  // delta time between two measurements
+  cinfo_msg->K[1] = ComputeDeltaAzimuth(azimuths_);  // average delta azimuth
+
   // D = [altitude, azimuth, azimuth offset, px offset]
   cinfo_msg->D = info_.beam_altitude_angles;
   cinfo_msg->D.insert(cinfo_msg->D.end(), azimuths_.begin(), azimuths_.end());
@@ -406,13 +409,9 @@ CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
         // z = d * sin(phi)
         const auto d = data[RANGE];
         const auto theta = data[AZIMUTH];
-        const auto x = d * cos_phi * std::cos(theta);
-        const auto y = d * cos_phi * std::sin(theta);
-        const auto z = d * sin_phi;
-
-        p.x = x;
-        p.y = -y;
-        p.z = z;
+        p.x = d * cos_phi * std::cos(theta);
+        p.y = -d * cos_phi * std::sin(theta);
+        p.z = d * sin_phi;
         p.intensity = data[INTENSITY];
 
         cloud.points.push_back(p);
@@ -470,7 +469,8 @@ Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity) {
   return m;
 }
 
-cv::Mat DestaggerImage(const cv::Mat& image, const std::vector<int>& offsets) {
+cv::Mat Decoder::DestaggerImage(const cv::Mat& image,
+                                const std::vector<int>& offsets) {
   // Destagger image
   cv::Mat fixed =
       cv::Mat(image.rows, image.cols, image.type(), cv::Scalar(kNaNF));
@@ -486,34 +486,44 @@ cv::Mat DestaggerImage(const cv::Mat& image, const std::vector<int>& offsets) {
   //    }
   //  });
 
-  // alphabet is a laser beam and number is time
+  /// VERY IMPORTANT NOTE!!!
+  // alphabet is a laser beam and number is measurement time
+  // so a0 is the top laser at the first measurement
   // The staggered image looks like this
-  // | a1 | a2 | a3 | a4 | a5 | a6 |
-  // | b1 | b2 | b3 | b4 | b5 | b6 |
-  // | c1 | c2 | c3 | c4 | c5 | c6 |
-  // | d1 | d2 | d3 | d4 | d5 | d6 |
+  // | a0 | a1 | a2 | a3 | a4 | a5 | a6 |
+  // | b0 | b1 | b2 | b3 | b4 | b5 | b6 |
+  // | c0 | c1 | c2 | c3 | c4 | c5 | c6 |
+  // | d0 | d1 | d2 | d3 | d4 | d5 | d6 |
 
-  // The destaggered image looks like
-  // | a1 | a2 | a3 | a4 | a5 | a6 |
-  // | b2 | b3 | b4 | b5 | b6 |
-  // | c3 | c4 | c5 | c6 |
-  // | d4 | d5 | d6 |
+  // The destaggered image looks like, assuming offset [0,1,2,3]
+  // | a0 | a1 | a2 | a3 | a4 | a5 | a6 |
+  // | b1 | b2 | b3 | b4 | b5 | b6 | __ |
+  // | c2 | c3 | c4 | c5 | c6 | __ | __ |
+  // | d3 | d4 | d5 | d6 | __ | __ | __ |
 
   // This means on client side, when an image arrives, one can directly
   // visualize the image and it would look normal (not staggered).
   // Each column roughly corresponds to the same azimuth angle.
   // To get the actual measurement id, add corresponding offset to the column
+  // For example, the first row will add offset 0 which means I(0, 0) is at time
+  // t0. If the second row has pixel offset 3, then I(1, 0) is measured at time
+  // t0 + 3 * dt
 
   for (int r = 0; r < image.rows; ++r) {
     const auto offset = offsets[r];
 
-    const auto* row_ptr_image = image.ptr<cv::Vec3f>(r);
+    auto const* const row_ptr_image = image.ptr<cv::Vec3f>(r);
     auto* row_ptr_fixed = fixed.ptr<cv::Vec3f>(r);
 
     for (int c = 0; c < image.cols - offset; ++c) {
       row_ptr_fixed[c] = row_ptr_image[c + offset];
     }
   }
+
+  // As a side effect, azimuths_ now should store the value of each column
+  // instead of the encoder value at that time
+  const auto azimuth_offset = info_.beam_azimuth_angles[0];
+  for (auto& azimuth : azimuths_) azimuth += azimuth_offset;
 
   return fixed;
 }
@@ -530,6 +540,16 @@ int freq_of_lidar_mode(lidar_mode mode) {
     default:
       throw std::invalid_argument{"freq_of_lidar_mode"};
   }
+}
+
+double ComputeDeltaAzimuth(const std::vector<double>& azimuths) {
+  // Compute delta azimuth
+  double sum_azimuth = 0.0;
+  for (int i = 1; i < azimuths.size(); ++i) {
+    auto diff = azimuths[i] - azimuths[i - 1];
+    sum_azimuth += diff < 0 ? diff + kTau : diff;
+  }
+  return sum_azimuth / (azimuths.size() - 1);
 }
 
 }  // namespace OS1
