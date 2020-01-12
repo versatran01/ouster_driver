@@ -1,155 +1,47 @@
 #include "ouster/os1_util.h"
 #include "ouster_ros/PacketMsg.h"
+#include "ouster_ros/cloud.h"
 #include "ouster_ros/os1_ros.h"
 
 #include "ouster_ros/OS1ConfigSrv.h"
 #include "ouster_ros/OusterOS1Config.h"
 
-#include <cv_bridge/cv_bridge.h>
 #include <dynamic_reconfigure/server.h>
 #include <image_transport/image_transport.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl_ros/point_cloud.h>
-#include <sensor_msgs/CameraInfo.h>
 #include <sensor_msgs/Imu.h>
 #include <sensor_msgs/PointCloud2.h>
 #include <tf2_ros/static_transform_broadcaster.h>
 
-#include <pcl/point_types.h>
 #include <Eigen/Geometry>
 
 namespace ouster_ros {
 namespace OS1 {
 
 using namespace ouster::OS1;
-using namespace sensor_msgs;  // Image, CameraInfo, Imu
-using Point = pcl::PointXYZI;
-using Cloud = pcl::PointCloud<Point>;
+using namespace sensor_msgs; // Image, CameraInfo, Imu
+using Point = cloud::Point;
+using Cloud = cloud::Cloud;
 
 static constexpr double deg2rad(double deg) { return deg * M_PI / 180.0; }
 static constexpr double rad2deg(double rad) { return rad * 180.0 / M_PI; }
 static constexpr float kTau = 2 * M_PI;
 static constexpr auto kNaNF = std::numeric_limits<float>::quiet_NaN();
 static constexpr auto kNaND = std::numeric_limits<double>::quiet_NaN();
-static constexpr float kRangeFactor = 0.001f;       // mm -> m
-static constexpr double kDefaultGravity = 9.81645;  // [m/s^2] in philadelphia
+static constexpr float kRangeFactor = 0.001f;      // mm -> m
+static constexpr double kDefaultGravity = 9.81645; // [m/s^2] in philadelphia
 
 /// Get frequency from lidar mode
 int freq_of_lidar_mode(lidar_mode mode);
 
 /// Convert a vector of double from deg to rad
-void TransformDeg2RadInPlace(std::vector<double>& vec) {
+void TransformDeg2RadInPlace(std::vector<double> &vec) {
   std::transform(vec.begin(), vec.end(), vec.begin(), deg2rad);
 }
 
-struct SinCos {
-  SinCos() = default;
-  SinCos(double rad) : sin{std::sin(rad)}, cos{std::cos(rad)} {}
-  double sin, cos;
-};
-
-/// Used for indexing into packet and image, (NOISE not used now)
-enum Index { RANGE = 0, INTENSITY = 1, AZIMUTH = 2, NOISE = 3 };
-
-template <typename Iter>
-std::vector<SinCos> PrecomputeSinCos(Iter first, Iter last) {
-  std::vector<SinCos> sc;
-  sc.reserve(std::distance(first, last));
-  while (first != last) sc.emplace_back(*first++);
-  return sc;
-}
-
-inline void PolarToCart(Point& p,
-                        const SinCos& ev,
-                        const SinCos& az,
-                        double r) {
-  p.x = r * ev.cos * az.cos;
-  p.y = -r * ev.cos * az.sin;
-  p.z = r * ev.sin;
-}
-
-/// Convert image and camera_info to point cloud
-Cloud ToCloud(const ImageConstPtr& image_msg,
-              const CameraInfo& cinfo_msg,
-              bool high_prec);
-
-/// High precision mode
-Cloud::VectorType ToCloud(const cv::Mat& image,
-                          const std::vector<SinCos>& elevations) {
-  Cloud::VectorType points;
-  points.reserve(image.total());
-
-  for (int r = 0; r < image.rows; ++r) {
-    const auto* const row_ptr = image.ptr<cv::Vec3f>(r);
-    for (int c = 0; c < image.cols; ++c) {
-      const cv::Vec3f& data = row_ptr[c];
-      const auto theta = data[AZIMUTH];
-
-      Point p;
-      if (std::isnan(data[RANGE])) {
-        p.x = p.y = p.z = p.intensity = kNaNF;
-      } else {
-        PolarToCart(p, elevations[r], {theta}, data[RANGE]);
-        p.intensity = data[INTENSITY];
-      }
-      points.push_back(p);
-    }  // c
-  }    // r
-
-  return points;
-}
-
-/// Low precision mode
-Cloud::VectorType ToCloud(const cv::Mat& image,
-                          const std::vector<SinCos>& elevations,
-                          const std::vector<SinCos>& azimuths) {
-  Cloud::VectorType points;
-  points.reserve(image.total());
-
-  for (int r = 0; r < image.rows; ++r) {
-    const auto* const row_ptr = image.ptr<cv::Vec3f>(r);
-    for (int c = 0; c < image.cols; ++c) {
-      const cv::Vec3f& data = row_ptr[c];
-      Point p;
-      if (std::isnan(data[RANGE])) {
-        p.x = p.y = p.z = p.intensity = kNaNF;
-      } else {
-        PolarToCart(p, elevations[r], azimuths[c], data[RANGE]);
-        p.intensity = data[INTENSITY];
-      }
-      points.push_back(p);
-    }  // c
-  }    // r
-
-  return points;
-}
-
-Cloud ToCloud(const ImageConstPtr& image_msg,
-              const CameraInfo& cinfo_msg,
-              bool high_prec) {
-  Cloud cloud;
-  const auto image = cv_bridge::toCvShare(image_msg)->image;
-  const auto elevations =
-      PrecomputeSinCos(cinfo_msg.D.cbegin(), cinfo_msg.D.cbegin() + image.rows);
-
-  if (high_prec) {
-    cloud.points = std::move(ToCloud(image, elevations));
-  } else {
-    const auto azimuths =
-        PrecomputeSinCos(cinfo_msg.D.cbegin() + image.rows,
-                         cinfo_msg.D.cbegin() + image.rows + image.cols);
-    cloud.points = std::move(ToCloud(image, elevations, azimuths));
-  }
-
-  cloud.header = pcl_conversions::toPCL(image_msg->header);
-  cloud.width = image.cols;
-  cloud.height = image.rows;
-
-  return cloud;
-}
-
 /// Convert imu packet imu msg
-Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity);
+Imu ToImu(const PacketMsg &p, const std::string &frame_id, double gravity);
 
 /**
  * @brief The Decoder class
@@ -178,22 +70,22 @@ Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity);
  * See class member variables and rqt_reconfigure.
  */
 class Decoder {
- public:
-  explicit Decoder(const ros::NodeHandle& pnh);
+public:
+  explicit Decoder(const ros::NodeHandle &pnh);
 
-  Decoder(const Decoder&) = delete;
-  Decoder operator=(const Decoder&) = delete;
+  Decoder(const Decoder &) = delete;
+  Decoder operator=(const Decoder &) = delete;
 
-  void LidarPacketCb(const PacketMsg& packet_msg);
-  void ImuPacketCb(const PacketMsg& packet_buf);
-  void ConfigCb(OusterOS1Config& config, int level);
+  void LidarPacketCb(const PacketMsg &packet_msg);
+  void ImuPacketCb(const PacketMsg &packet_buf);
+  void ConfigCb(OusterOS1Config &config, int level);
 
- private:
+private:
   /// Reset cached image, azimuths, timestamps and curr_col
   void Reset();
   /// Decode a single packet
-  void DecodeAndFill(const uint8_t* const packet);
-  cv::Mat DestaggerImage(const cv::Mat& image, const std::vector<int>& offsets);
+  void DecodeAndFill(const uint8_t *const packet);
+  cv::Mat DestaggerImage(const cv::Mat &image, const std::vector<int> &offsets);
 
   // ros
   ros::NodeHandle pnh_;
@@ -207,20 +99,20 @@ class Decoder {
   OusterOS1Config config_;
 
   // OS1
-  sensor_info info_;                  // from os1
-  std::vector<uint64_t> timestamps_;  // timestamps of each col
-  std::vector<double> azimuths_;      // nomial azimuth of each col (no offset)
-  cv::Mat image_;                     // image to fill with packets
-  int curr_col_{0};                   // tracks current column
+  sensor_info info_;                 // from os1
+  std::vector<uint64_t> timestamps_; // timestamps of each col
+  std::vector<double> azimuths_;     // nomial azimuth of each col (no offset)
+  cv::Mat image_;                    // image to fill with packets
+  int curr_col_{0};                  // tracks current column
 
   // params
-  bool use_intensity_;           // true - intensity, false - reflectivity
-  double gravity_;               // gravity magnitude m/s^2
-  uint64_t firing_cycle_ns_{0};  // time ns between two measurements
+  bool use_intensity_;          // true - intensity, false - reflectivity
+  double gravity_;              // gravity magnitude m/s^2
+  uint64_t firing_cycle_ns_{0}; // time ns between two measurements
   std::string lidar_frame_, imu_frame_;
 };
 
-Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
+Decoder::Decoder(const ros::NodeHandle &pnh) : pnh_(pnh), it_(pnh) {
   // Call service to retrieve sensor information, this must be done first
   OS1ConfigSrv os1_srv;
   auto client = pnh_.serviceClient<ouster_ros::OS1ConfigSrv>("os1_config");
@@ -230,7 +122,7 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   // Note these are all degrees
   if (client.call(os1_srv)) {
     ROS_INFO("Reading sensor info from os1 config");
-    const auto& cfg = os1_srv.response;
+    const auto &cfg = os1_srv.response;
     info_.beam_altitude_angles = cfg.beam_altitude_angles;
     info_.beam_azimuth_angles = cfg.beam_azimuth_angles;
     info_.imu_to_sensor_transform = cfg.imu_to_sensor_transform;
@@ -285,7 +177,7 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   const Eigen::Map<Matrix4dRow> T_S_L(info_.lidar_to_sensor_transform.data());
   const Eigen::Map<Matrix4dRow> T_S_I(info_.imu_to_sensor_transform.data());
   Eigen::Map<Matrix4dRow> T_L_I(imu_to_lidar_transform.data());
-  T_L_I = T_S_L.inverse() * T_S_I;  // T_L_I = T_L_S * T_S_I
+  T_L_I = T_S_L.inverse() * T_S_I; // T_L_I = T_L_S * T_S_I
 
   ROS_INFO_STREAM("T_S_L:\n" << T_S_L);
   ROS_INFO_STREAM("T_S_I:\n" << T_S_I);
@@ -306,7 +198,7 @@ Decoder::Decoder(const ros::NodeHandle& pnh) : pnh_(pnh), it_(pnh) {
   server_.setCallback(boost::bind(&Decoder::ConfigCb, this, _1, _2));
 }
 
-void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
+void Decoder::LidarPacketCb(const PacketMsg &packet_msg) {
   const auto start = ros::Time::now();
 
   // Once we get a packet, just going to decoede it and fill in right away
@@ -338,15 +230,15 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   cinfo_msg->height = image_msg->height;
   cinfo_msg->width = image_msg->width;
   cinfo_msg->distortion_model = info_.hostname;
-  cinfo_msg->K[0] = firing_cycle_ns_;  // delta time between two measurements
+  cinfo_msg->K[0] = firing_cycle_ns_; // delta time between two measurements
 
   // D = [altitude, azimuth, px offset]
   cinfo_msg->D = info_.beam_altitude_angles;
   cinfo_msg->D.insert(cinfo_msg->D.end(), azimuths_.cbegin(), azimuths_.cend());
+  cinfo_msg->D.insert(cinfo_msg->D.end(), offsets.cbegin(), offsets.cend());
   //  cinfo_msg->D.insert(cinfo_msg->D.end(),
   //                      info_.beam_azimuth_angles.begin(),
   //                      info_.beam_azimuth_angles.end());
-  cinfo_msg->D.insert(cinfo_msg->D.end(), offsets.cbegin(), offsets.cend());
 
   // Publish on demand
   if (camera_pub_.getNumSubscribers() > 0) {
@@ -354,7 +246,7 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   }
 
   if (lidar_pub_.getNumSubscribers() > 0) {
-    lidar_pub_.publish(ToCloud(image_msg, *cinfo_msg, false));
+    lidar_pub_.publish(cloud::ToCloud(image_msg, *cinfo_msg, false));
   }
 
   if (range_pub_.getNumSubscribers() > 0 ||
@@ -363,14 +255,14 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
     cv::Mat sep[3];
     cv::split(fixed, sep);
 
-    cv::Mat range = sep[RANGE];
+    cv::Mat range = sep[cloud::RANGE];
     // should be 2, use 3 for more contrast
     range.convertTo(range, CV_8UC1, 3.0);
     range_pub_.publish(
         cv_bridge::CvImage(header, image_encodings::MONO8, range).toImageMsg());
 
     // use 300 for more contrast
-    cv::Mat intensity = sep[INTENSITY];
+    cv::Mat intensity = sep[cloud::INTENSITY];
     double a, b;
     cv::minMaxIdx(intensity, &a, &b);
     intensity.convertTo(intensity, CV_8UC1, 255 / (b - a), 255 * a / (a - b));
@@ -384,12 +276,12 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   ROS_DEBUG("Total time: %f", (ros::Time::now() - start).toSec());
 }
 
-void Decoder::ImuPacketCb(const PacketMsg& packet_msg) {
+void Decoder::ImuPacketCb(const PacketMsg &packet_msg) {
   const auto imu_msg = ToImu(packet_msg, imu_frame_, gravity_);
   imu_pub_.publish(imu_msg);
 }
 
-void Decoder::ConfigCb(OusterOS1Config& config, int level) {
+void Decoder::ConfigCb(OusterOS1Config &config, int level) {
   if (config.full_sweep) {
     config.image_width = n_cols_of_lidar_mode(info_.mode);
   } else {
@@ -399,8 +291,7 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
   }
 
   ROS_INFO("Reconfigure Request: image_width: %d, full_sweep: %s",
-           config.image_width,
-           config.full_sweep ? "True" : "False");
+           config.image_width, config.full_sweep ? "True" : "False");
 
   config_ = config;
   Reset();
@@ -425,18 +316,18 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
 
 void Decoder::Reset() {
   curr_col_ = 0;
-  image_ = cv::Mat(
-      pixels_per_column, config_.image_width, CV_32FC3, cv::Scalar(kNaNF));
+  image_ = cv::Mat(pixels_per_column, config_.image_width, CV_32FC3,
+                   cv::Scalar(kNaNF));
   azimuths_.clear();
   azimuths_.resize(config_.image_width, kNaND);
   timestamps_.clear();
   timestamps_.resize(config_.image_width, 0);
 }
 
-void Decoder::DecodeAndFill(const uint8_t* const packet_buf) {
+void Decoder::DecodeAndFill(const uint8_t *const packet_buf) {
   // Decode each azimuth block (16 per packet)
   for (int icol = 0; icol < columns_per_buffer; ++icol, ++curr_col_) {
-    const uint8_t* col_buf = nth_col(icol, packet_buf);
+    const uint8_t *col_buf = nth_col(icol, packet_buf);
     // const uint16_t m_id = col_measurement_id(col_buf);
     const bool valid = col_valid(col_buf) == 0xffffffff;
 
@@ -447,33 +338,34 @@ void Decoder::DecodeAndFill(const uint8_t* const packet_buf) {
     }
 
     // Add pi to theta to compensate for the lidar frame change
-    float theta0 = col_h_angle(col_buf) + M_PI;  // rad
+    float theta0 = col_h_angle(col_buf) + M_PI; // rad
 
     // make sure theta \in [0, 2pi), always >=0 so no need to check the other
     // way
-    if (theta0 >= kTau) theta0 -= kTau;
+    if (theta0 >= kTau)
+      theta0 -= kTau;
 
     azimuths_[curr_col_] = theta0;
     timestamps_[curr_col_] = col_timestamp(col_buf);
 
     // Decode each beam (64 per block)
     for (uint8_t ipx = 0; ipx < pixels_per_column; ++ipx) {
-      const uint8_t* px_buf = nth_px(ipx, col_buf);
+      const uint8_t *px_buf = nth_px(ipx, col_buf);
       const uint32_t range = px_range(px_buf);
 
-      auto& v = image_.at<cv::Vec3f>(ipx, curr_col_);
+      auto &v = image_.at<cv::Vec3f>(ipx, curr_col_);
       // we use reflectivity which is intensity scaled based on range
-      v[RANGE] = range * kRangeFactor;
-      v[INTENSITY] =
+      v[cloud::RANGE] = range * kRangeFactor;
+      v[cloud::INTENSITY] =
           use_intensity_ ? px_signal_photons(px_buf) : px_reflectivity(px_buf);
-      v[AZIMUTH] = theta0 + info_.beam_azimuth_angles[ipx];
+      v[cloud::AZIMUTH] = theta0 + info_.beam_azimuth_angles[ipx];
     }
   }
 }
 
-Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity) {
+Imu ToImu(const PacketMsg &p, const std::string &frame_id, double gravity) {
   Imu m;
-  const uint8_t* buf = p.buf.data();
+  const uint8_t *buf = p.buf.data();
 
   // From software manual 1.13
   // Ouster provides timestamps for both the gyro and accelerometer in order to
@@ -510,8 +402,8 @@ Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity) {
   return m;
 }
 
-cv::Mat Decoder::DestaggerImage(const cv::Mat& image,
-                                const std::vector<int>& offsets) {
+cv::Mat Decoder::DestaggerImage(const cv::Mat &image,
+                                const std::vector<int> &offsets) {
   // Destagger image
   cv::Mat fixed =
       cv::Mat(image.rows, image.cols, image.type(), cv::Scalar(kNaNF));
@@ -554,8 +446,8 @@ cv::Mat Decoder::DestaggerImage(const cv::Mat& image,
   for (int r = 0; r < image.rows; ++r) {
     const auto offset = offsets[r];
 
-    auto const* const row_ptr_image = image.ptr<cv::Vec3f>(r);
-    auto* row_ptr_fixed = fixed.ptr<cv::Vec3f>(r);
+    auto const *const row_ptr_image = image.ptr<cv::Vec3f>(r);
+    auto *row_ptr_fixed = fixed.ptr<cv::Vec3f>(r);
 
     for (int c = 0; c < image.cols - offset; ++c) {
       row_ptr_fixed[c] = row_ptr_image[c + offset];
@@ -567,29 +459,30 @@ cv::Mat Decoder::DestaggerImage(const cv::Mat& image,
   // In this case, since we use the first beam's azimuth angle, we should add
   // offset[0]
   const auto azimuth_offset = info_.beam_azimuth_angles[0];
-  for (auto& azimuth : azimuths_) azimuth += azimuth_offset;
+  for (auto &azimuth : azimuths_)
+    azimuth += azimuth_offset;
 
   return fixed;
 }
 
 int freq_of_lidar_mode(lidar_mode mode) {
   switch (mode) {
-    case MODE_512x10:
-    case MODE_1024x10:
-    case MODE_2048x10:
-      return 10;
-    case MODE_512x20:
-    case MODE_1024x20:
-      return 20;
-    default:
-      throw std::invalid_argument{"freq_of_lidar_mode"};
+  case MODE_512x10:
+  case MODE_1024x10:
+  case MODE_2048x10:
+    return 10;
+  case MODE_512x20:
+  case MODE_1024x20:
+    return 20;
+  default:
+    throw std::invalid_argument{"freq_of_lidar_mode"};
   }
 }
 
-}  // namespace OS1
-}  // namespace ouster_ros
+} // namespace OS1
+} // namespace ouster_ros
 
-int main(int argc, char** argv) {
+int main(int argc, char **argv) {
   ros::init(argc, argv, "os1_decoder");
   ros::NodeHandle pnh("~");
 

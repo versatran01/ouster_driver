@@ -8,3 +8,5 @@ ouster_viz/src
 /usr/include/pcl-1.8
 /opt/ros/melodic/include
 ~/Workspace/ws/sv_ws/devel/include
+ouster_ros/src
+ouster_ros/include/ouster_ros
