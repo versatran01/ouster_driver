@@ -23,8 +23,8 @@ namespace OS1 {
 
 using namespace ouster::OS1;
 using namespace sensor_msgs;  // Image, CameraInfo, Imu
-using PointT = pcl::PointXYZI;
-using CloudT = pcl::PointCloud<PointT>;
+using Point = pcl::PointXYZI;
+using Cloud = pcl::PointCloud<Point>;
 
 static constexpr double deg2rad(double deg) { return deg * M_PI / 180.0; }
 static constexpr double rad2deg(double rad) { return rad * 180.0 / M_PI; }
@@ -42,18 +42,114 @@ void TransformDeg2RadInPlace(std::vector<double>& vec) {
   std::transform(vec.begin(), vec.end(), vec.begin(), deg2rad);
 }
 
-/// Convert image to point cloud
-CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
-               bool organized);
-
-/// Convert imu packet imu msg
-Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity);
-
-/// Compute average delta azimuth
-double ComputeDeltaAzimuth(const std::vector<double>& azimuths);
+struct SinCos {
+  SinCos() = default;
+  SinCos(double rad) : sin{std::sin(rad)}, cos{std::cos(rad)} {}
+  double sin, cos;
+};
 
 /// Used for indexing into packet and image, (NOISE not used now)
 enum Index { RANGE = 0, INTENSITY = 1, AZIMUTH = 2, NOISE = 3 };
+
+template <typename Iter>
+std::vector<SinCos> PrecomputeSinCos(Iter first, Iter last) {
+  std::vector<SinCos> sc;
+  sc.reserve(std::distance(first, last));
+  while (first != last) sc.emplace_back(*first++);
+  return sc;
+}
+
+inline void PolarToCart(Point& p,
+                        const SinCos& ev,
+                        const SinCos& az,
+                        double r) {
+  p.x = r * ev.cos * az.cos;
+  p.y = -r * ev.cos * az.sin;
+  p.z = r * ev.sin;
+}
+
+/// Convert image and camera_info to point cloud
+Cloud ToCloud(const ImageConstPtr& image_msg,
+              const CameraInfo& cinfo_msg,
+              bool high_prec);
+
+/// High precision mode
+Cloud::VectorType ToCloud(const cv::Mat& image,
+                          const std::vector<SinCos>& elevations) {
+  Cloud::VectorType points;
+  points.reserve(image.total());
+
+  for (int r = 0; r < image.rows; ++r) {
+    const auto* const row_ptr = image.ptr<cv::Vec3f>(r);
+    for (int c = 0; c < image.cols; ++c) {
+      const cv::Vec3f& data = row_ptr[c];
+      const auto theta = data[AZIMUTH];
+
+      Point p;
+      if (std::isnan(data[RANGE])) {
+        p.x = p.y = p.z = p.intensity = kNaNF;
+      } else {
+        PolarToCart(p, elevations[r], {theta}, data[RANGE]);
+        p.intensity = data[INTENSITY];
+      }
+      points.push_back(p);
+    }  // c
+  }    // r
+
+  return points;
+}
+
+/// Low precision mode
+Cloud::VectorType ToCloud(const cv::Mat& image,
+                          const std::vector<SinCos>& elevations,
+                          const std::vector<SinCos>& azimuths) {
+  Cloud::VectorType points;
+  points.reserve(image.total());
+
+  for (int r = 0; r < image.rows; ++r) {
+    const auto* const row_ptr = image.ptr<cv::Vec3f>(r);
+    for (int c = 0; c < image.cols; ++c) {
+      const cv::Vec3f& data = row_ptr[c];
+      Point p;
+      if (std::isnan(data[RANGE])) {
+        p.x = p.y = p.z = p.intensity = kNaNF;
+      } else {
+        PolarToCart(p, elevations[r], azimuths[c], data[RANGE]);
+        p.intensity = data[INTENSITY];
+      }
+      points.push_back(p);
+    }  // c
+  }    // r
+
+  return points;
+}
+
+Cloud ToCloud(const ImageConstPtr& image_msg,
+              const CameraInfo& cinfo_msg,
+              bool high_prec) {
+  Cloud cloud;
+  const auto image = cv_bridge::toCvShare(image_msg)->image;
+  const auto elevations =
+      PrecomputeSinCos(cinfo_msg.D.cbegin(), cinfo_msg.D.cbegin() + image.rows);
+
+  if (high_prec) {
+    cloud.points = std::move(ToCloud(image, elevations));
+  } else {
+    const auto azimuths =
+        PrecomputeSinCos(cinfo_msg.D.cbegin() + image.rows,
+                         cinfo_msg.D.cbegin() + image.rows + image.cols);
+    cloud.points = std::move(ToCloud(image, elevations, azimuths));
+  }
+
+  cloud.header = pcl_conversions::toPCL(image_msg->header);
+  cloud.width = image.cols;
+  cloud.height = image.rows;
+
+  return cloud;
+}
+
+/// Convert imu packet imu msg
+Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity);
 
 /**
  * @brief The Decoder class
@@ -243,14 +339,14 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   cinfo_msg->width = image_msg->width;
   cinfo_msg->distortion_model = info_.hostname;
   cinfo_msg->K[0] = firing_cycle_ns_;  // delta time between two measurements
-  cinfo_msg->K[1] = ComputeDeltaAzimuth(azimuths_);  // average delta azimuth
 
-  // D = [altitude, azimuth, azimuth offset, px offset]
+  // D = [altitude, azimuth, px offset]
   cinfo_msg->D = info_.beam_altitude_angles;
-  cinfo_msg->D.insert(cinfo_msg->D.end(), azimuths_.begin(), azimuths_.end());
-  cinfo_msg->D.insert(cinfo_msg->D.end(), info_.beam_azimuth_angles.begin(),
-                      info_.beam_azimuth_angles.end());
-  cinfo_msg->D.insert(cinfo_msg->D.end(), offsets.begin(), offsets.end());
+  cinfo_msg->D.insert(cinfo_msg->D.end(), azimuths_.cbegin(), azimuths_.cend());
+  //  cinfo_msg->D.insert(cinfo_msg->D.end(),
+  //                      info_.beam_azimuth_angles.begin(),
+  //                      info_.beam_azimuth_angles.end());
+  cinfo_msg->D.insert(cinfo_msg->D.end(), offsets.cbegin(), offsets.cend());
 
   // Publish on demand
   if (camera_pub_.getNumSubscribers() > 0) {
@@ -258,7 +354,7 @@ void Decoder::LidarPacketCb(const PacketMsg& packet_msg) {
   }
 
   if (lidar_pub_.getNumSubscribers() > 0) {
-    lidar_pub_.publish(ToCloud(image_msg, *cinfo_msg, config_.organized));
+    lidar_pub_.publish(ToCloud(image_msg, *cinfo_msg, false));
   }
 
   if (range_pub_.getNumSubscribers() > 0 ||
@@ -302,10 +398,9 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
     config.image_width *= columns_per_buffer;
   }
 
-  ROS_INFO(
-      "Reconfigure Request: image_width: %d, organized: %s, full_sweep: %s",
-      config.image_width, config.organized ? "True" : "False",
-      config.full_sweep ? "True" : "False");
+  ROS_INFO("Reconfigure Request: image_width: %d, full_sweep: %s",
+           config.image_width,
+           config.full_sweep ? "True" : "False");
 
   config_ = config;
   Reset();
@@ -330,8 +425,8 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
 
 void Decoder::Reset() {
   curr_col_ = 0;
-  image_ = cv::Mat(pixels_per_column, config_.image_width, CV_32FC3,
-                   cv::Scalar(kNaNF));
+  image_ = cv::Mat(
+      pixels_per_column, config_.image_width, CV_32FC3, cv::Scalar(kNaNF));
   azimuths_.clear();
   azimuths_.resize(config_.image_width, kNaND);
   timestamps_.clear();
@@ -374,60 +469,6 @@ void Decoder::DecodeAndFill(const uint8_t* const packet_buf) {
       v[AZIMUTH] = theta0 + info_.beam_azimuth_angles[ipx];
     }
   }
-}
-
-CloudT ToCloud(const ImageConstPtr& image_msg, const CameraInfo& cinfo_msg,
-               bool organized) {
-  CloudT cloud;
-
-  const auto image = cv_bridge::toCvShare(image_msg)->image;
-  const auto& altitude_angles = cinfo_msg.D;  // might be unsafe
-
-  cloud.header = pcl_conversions::toPCL(image_msg->header);
-  cloud.reserve(image.total());
-
-  for (int r = 0; r < image.rows; ++r) {
-    const auto* const row_ptr = image.ptr<cv::Vec3f>(r);
-    // Because image row 0 is the highest laser point
-    const auto phi = altitude_angles[r];
-    const auto cos_phi = std::cos(phi);
-    const auto sin_phi = std::sin(phi);
-
-    for (int c = 0; c < image.cols; ++c) {
-      const cv::Vec3f& data = row_ptr[c];
-
-      PointT p;
-      if (std::isnan(data[RANGE])) {
-        if (organized) {
-          p.x = p.y = p.z = p.intensity = kNaNF;
-          cloud.points.push_back(p);
-        }
-      } else {
-        // p.23 lidar range data to xyz lidar coordinate frame
-        // x = d * cos(phi) * cos(theta);
-        // y = d * cos(phi) * sin(theta);
-        // z = d * sin(phi)
-        const auto d = data[RANGE];
-        const auto theta = data[AZIMUTH];
-        p.x = d * cos_phi * std::cos(theta);
-        p.y = -d * cos_phi * std::sin(theta);
-        p.z = d * sin_phi;
-        p.intensity = data[INTENSITY];
-
-        cloud.points.push_back(p);
-      }
-    }
-  }
-
-  if (organized) {
-    cloud.width = image.cols;
-    cloud.height = image.rows;
-  } else {
-    cloud.width = cloud.size();
-    cloud.height = 1;
-  }
-
-  return cloud;
 }
 
 Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity) {
@@ -502,12 +543,13 @@ cv::Mat Decoder::DestaggerImage(const cv::Mat& image,
   // | d3 | d4 | d5 | d6 | __ | __ | __ |
 
   // This means on client side, when an image arrives, one can directly
-  // visualize the image and it would look normal (not staggered).
-  // Each column roughly corresponds to the same azimuth angle.
-  // To get the actual measurement id, add corresponding offset to the column
-  // For example, the first row will add offset 0 which means I(0, 0) is at time
-  // t0. If the second row has pixel offset 3, then I(1, 0) is measured at time
-  // t0 + 3 * dt
+  // visualize the image and it would look normal (not staggered) and spatial
+  // relationship is preserved. Each column roughly corresponds to the same
+  // azimuth angle. To get the actual measurement id, add corresponding offset
+  // to the column. For example, the first row will add offset 0 which means
+  // I(0, 0) is at time t0. If the second row has pixel offset 1, then I(1, 0)
+  // is measured at time t0 + 1 * dt, as can be seen from the second plot, where
+  // I(1,0) = b1, which means beam number b with measurement 1
 
   for (int r = 0; r < image.rows; ++r) {
     const auto offset = offsets[r];
@@ -520,8 +562,10 @@ cv::Mat Decoder::DestaggerImage(const cv::Mat& image,
     }
   }
 
-  // As a side effect, azimuths_ now should store the value of each column
+  // As a side effect, azimuths_ should now store the value of each column
   // instead of the encoder value at that time
+  // In this case, since we use the first beam's azimuth angle, we should add
+  // offset[0]
   const auto azimuth_offset = info_.beam_azimuth_angles[0];
   for (auto& azimuth : azimuths_) azimuth += azimuth_offset;
 
@@ -540,16 +584,6 @@ int freq_of_lidar_mode(lidar_mode mode) {
     default:
       throw std::invalid_argument{"freq_of_lidar_mode"};
   }
-}
-
-double ComputeDeltaAzimuth(const std::vector<double>& azimuths) {
-  // Compute delta azimuth
-  double sum_azimuth = 0.0;
-  for (int i = 1; i < azimuths.size(); ++i) {
-    auto diff = azimuths[i] - azimuths[i - 1];
-    sum_azimuth += diff < 0 ? diff + kTau : diff;
-  }
-  return sum_azimuth / (azimuths.size() - 1);
 }
 
 }  // namespace OS1
