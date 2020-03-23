@@ -1,6 +1,5 @@
 <launch>
-    <arg name="ns_in" default="/os1_node"/>
-    <arg name="ns_out" default="$(arg ns_in)"/>
+    <arg name="ns" default="os1_node"/>
 
     <arg name="lidar_frame" default="lidar"/>
     <arg name="imu_frame" default="imu"/>
@@ -12,7 +11,7 @@
     <arg name="debug" default="false"/>
     <env if="$(arg debug)" name="ROSCONSOLE_CONFIG_FILE" value="$(find ouster_ros)/launch/debug.conf"/>
 
-    <node pkg="ouster_ros" type="os1_decoder" name="os1_decoder" output="screen" ns="$(arg ns_in)">
+    <node pkg="ouster_ros" type="os1_decoder" name="os1_decoder" output="screen" ns="$(arg ns)">
         <param name="image_width" type="int" value="$(arg image_width)"/>
         <param name="use_intensity" type="bool" value="$(arg use_intensity)"/>
         <param name="full_sweep" type="bool" value="$(arg full_sweep)"/>
@@ -23,10 +22,10 @@
         <remap from="~lidar_packets" to="lidar_packets"/>
         <remap from="~imu_packets" to="imu_packets"/>
 
-        <remap from="~imu" to="$(arg ns_out)/imu"/>
-        <remap from="~cloud" to="$(arg ns_out)/cloud"/>
-        <remap from="~image" to="$(arg ns_out)/image"/>
-        <remap from="~camera_info" to="$(arg ns_out)/camera_info"/>
+        <remap from="~imu" to="imu"/>
+        <remap from="~cloud" to="cloud"/>
+        <remap from="~image" to="image"/>
+        <remap from="~camera_info" to="camera_info"/>
     </node>
 
 </launch>
