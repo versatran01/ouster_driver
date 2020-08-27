@@ -55,10 +55,11 @@ Imu ToImu(const PacketMsg& p, const std::string& frame_id, double gravity);
  * translational offset.
  *
  * Image:
- * Decoded lidar packets are stored in sensor_msgs::Image. This image is a
- * 3-channel float image. The channels are [range, intensity, azimuth]. Each
- * column is one measurement taken at the same time (but not at the same azimuth
- * angle). This means that this image is staggered.
+ * Decoded lidar packets are stored in a sensor_msgs::Image. This
+ * image is a 3-channel float image. The channels are [range,
+ * intensity, azimuth]. The image has been de-staggered for
+ * legibility. This means that each column contains measurements taken
+ * at different times, but approximately the same azimuth angle.
  *
  * Camera Info:
  * Auxillary information is stored in sensor_msgs::CameraInfo. The time between
@@ -100,7 +101,7 @@ class Decoder {
   // OS1
   sensor_info info_;                  // from os1
   std::vector<uint64_t> timestamps_;  // timestamps of each col
-  std::vector<double> azimuths_;      // nomial azimuth of each col (no offset)
+  std::vector<double> azimuths_;      // nominal azimuth of each col (no offset)
   cv::Mat image_;                     // image to fill with packets
   int curr_col_{0};                   // tracks current column
 
@@ -333,6 +334,9 @@ void Decoder::DecodeAndFill(const uint8_t* const packet_buf) {
     // const uint16_t m_id = col_measurement_id(col_buf);
     const bool valid = col_valid(col_buf) == 0xffffffff;
 
+    // See note in `LidarPacketCb` regarding validity
+    timestamps_[curr_col_] = col_timestamp(col_buf);
+
     // drop invalid data in case of misconfiguration
     if (!valid) {
       ROS_DEBUG("Got invalid data block");
@@ -347,7 +351,6 @@ void Decoder::DecodeAndFill(const uint8_t* const packet_buf) {
     if (theta0 >= kTau) theta0 -= kTau;
 
     azimuths_[curr_col_] = theta0;
-    timestamps_[curr_col_] = col_timestamp(col_buf);
 
     // Decode each beam (64 per block)
     for (uint8_t ipx = 0; ipx < pixels_per_column; ++ipx) {
