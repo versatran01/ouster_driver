@@ -1,5 +1,7 @@
 #include "cloud.hpp"
 
+#include <pcl_conversions/pcl_conversions.h>
+
 namespace cloud {
 
 Cloud::VectorType ToPoints(const cv::Mat &image,
