@@ -60,26 +60,26 @@ add_executable(os1_node src/os1_node.cpp)
 target_link_libraries(os1_node ouster_ros ${catkin_LIBRARIES})
 add_dependencies(os1_node ${PROJECT_NAME}_gencpp)
 
-add_executable(os1_cloud_node src/os1_cloud_node.cpp)
-target_link_libraries(os1_cloud_node ouster_ros ${catkin_LIBRARIES})
-add_dependencies(os1_cloud_node ${PROJECT_NAME}_gencpp)
+# add_executable(os1_cloud_node src/os1_cloud_node.cpp)
+# target_link_libraries(os1_cloud_node ouster_ros ${catkin_LIBRARIES})
+# add_dependencies(os1_cloud_node ${PROJECT_NAME}_gencpp)
 
-add_executable(viz_node src/viz_node.cpp)
-target_link_libraries(viz_node ${catkin_LIBRARIES})
-add_dependencies(viz_node ${PROJECT_NAME}_gencpp)
+# add_executable(viz_node src/viz_node.cpp)
+# target_link_libraries(viz_node ${catkin_LIBRARIES})
+# add_dependencies(viz_node ${PROJECT_NAME}_gencpp)
 
-add_executable(img_node src/img_node.cpp)
-target_link_libraries(img_node ouster_ros ${catkin_LIBRARIES})
-add_dependencies(img_node ${PROJECT_NAME}_gencpp)
+# add_executable(img_node src/img_node.cpp)
+# target_link_libraries(img_node ouster_ros ${catkin_LIBRARIES})
+# add_dependencies(img_node ${PROJECT_NAME}_gencpp)
 
 # decoder
-add_executable(os1_decoder src/os1_decoder.cpp)
-target_include_directories(os1_decoder PUBLIC ${catkin_INCLUDE_DIRS} include)
-target_link_libraries(os1_decoder PUBLIC ${catkin_LIBRARIES} ouster_ros)
+add_executable(os1_decoder src/os1_decoder.cpp src/cloud.cpp)
+target_include_directories(os1_decoder PRIVATE ${catkin_INCLUDE_DIRS} include src)
+target_link_libraries(os1_decoder PRIVATE ${catkin_LIBRARIES} ouster_ros)
 add_dependencies(os1_decoder ${PROJECT_NAME}_gencfg)
 
 install(
-  TARGETS os1_node os1_cloud_node viz_node img_node os1_decoder
+  TARGETS os1_node os1_decoder #os1_cloud_node viz_node img_node 
   ARCHIVE DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   LIBRARY DESTINATION ${CATKIN_PACKAGE_LIB_DESTINATION}
   RUNTIME DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION})

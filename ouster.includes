@@ -4,9 +4,8 @@ ouster_viz/include
 ouster_viz/src
 
 /usr/local/include
-/usr/local/include/eigen3
-/usr/include/pcl-1.8
-/opt/ros/melodic/include
-~/Workspace/ws/sv_ws/devel/include
+/usr/include/eigen3
+/usr/include/pcl-1.10
+/usr/local/include/opencv4
+/opt/ros/noetic/include
 ouster_ros/src
-ouster_ros/include/ouster_ros

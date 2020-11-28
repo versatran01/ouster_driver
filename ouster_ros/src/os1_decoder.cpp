@@ -8,11 +8,11 @@
 
 #include <Eigen/Geometry>
 
+#include "cloud.hpp"
 #include "ouster/os1_util.h"
 #include "ouster_ros/OS1ConfigSrv.h"
 #include "ouster_ros/OusterOS1Config.h"
 #include "ouster_ros/PacketMsg.h"
-#include "ouster_ros/cloud.h"
 #include "ouster_ros/os1_ros.h"
 
 namespace ouster_ros {
@@ -293,8 +293,7 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
   }
 
   ROS_INFO("Reconfigure Request: image_width: %d, full_sweep: %s",
-           config.image_width,
-           config.full_sweep ? "True" : "False");
+           config.image_width, config.full_sweep ? "True" : "False");
 
   config_ = config;
   Reset();
@@ -319,8 +318,8 @@ void Decoder::ConfigCb(OusterOS1Config& config, int level) {
 
 void Decoder::Reset() {
   curr_col_ = 0;
-  image_ = cv::Mat(
-      pixels_per_column, config_.image_width, CV_32FC3, cv::Scalar(kNaNF));
+  image_ = cv::Mat(pixels_per_column, config_.image_width, CV_32FC3,
+                   cv::Scalar(kNaNF));
   azimuths_.clear();
   azimuths_.resize(config_.image_width, kNaND);
   timestamps_.clear();
